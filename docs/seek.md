@@ -136,9 +136,9 @@ Every flag has an env var. `seek serve`:
 | `--bootstrap`, `--cursor-us` | `SEEK_BOOTSTRAP`, `SEEK_BOOTSTRAP_CURSOR_US` | | The first state when `--dir` has none, and the Jetstream time it's consistent with |
 | `--interval-seconds` | `SEEK_INTERVAL_SECONDS` | 900 | Between artifacts |
 | `--index` | `SEEK_INDEX` | `profiles` | Who's indexed: anyone with a profile record, or `all` the DIDs it knows |
-| `--marco-admin`, `--marco-token-file` | `SEEK_MARCO_ADMIN`, `SEEK_MARCO_TOKEN_FILE` | | On each new marco checkpoint: mirror it into `DIR/mirror`, then PageRank into `DIR/ranks` |
+| `--marco-admin`, `--marco-token-file` | `SEEK_MARCO_ADMIN`, `SEEK_MARCO_TOKEN_FILE` | | On each new marco checkpoint: mirror it into `DIR/mirror`, then PageRank into `DIR/ranks`. The token is marco's export token (`--export-token-file`), which opens the checkpoint export alone. The peek has a 30 s deadline; a mirror past 3 h or a PageRank past 2 h is killed |
 | `--marco-load` | `SEEK_MARCO_LOAD` | `marco-load` | The binary that mirrors and ranks |
-| `--pagerank-source`, `--pagerank-memory` | `SEEK_PAGERANK_SOURCE`, `SEEK_PAGERANK_MEMORY` | `csr-inset`, `16GiB` | `csr-inset` peaks near 27 GB on the whole network and takes about 20 s warm; `inset` near 10 GB and slower |
+| `--pagerank-source`, `--pagerank-memory` | `SEEK_PAGERANK_SOURCE`, `SEEK_PAGERANK_MEMORY` | `inset`, `16GiB` | `inset` iterates over the mirror's in sets: on the whole network 33 passes and 69 s cold, 10 passes and 27 s warm from a day-old graph's ranks, ~14 GB peak. `csr-inset` builds an in-edge CSR first: about twice as fast, but ~27 GB peak, so a ~45 GB builder |
 | `--ranks`, `--ranks-token-file` | `SEEK_RANKS`, `SEEK_RANKS_TOKEN_FILE` | | Ranks from elsewhere: a ranks file or directory, or a URL |
 | `--without-ranks` | | off | Publish without ranks. Otherwise the builder won't publish until it has them, since the ranks carry marco's takedowns |
 | `--keep` | `SEEK_KEEP` | 4 | Artifacts kept, locally and in the bucket |
@@ -196,7 +196,8 @@ thread, as marco's op histograms are.
 | `seek_builder_last_success_timestamp_seconds`, `seek_builder_artifact_bytes`, `seek_builder_upload_seconds`, `seek_builder_ranks_age_seconds` | | |
 | `seek_builder_actors` | `state`: `known`, `indexed`, `handle_verified`, `handle_unverified`, `hidden` | |
 | `seek_pagerank_passes`, `seek_pagerank_l1`, `seek_pagerank_seconds` | | The last run |
-| `seek_pagerank_runs_total` | `result` | |
+| `seek_pagerank_runs_total` | `result`: `ok`, `error`, `timeout`, `unreachable` | PageRank runs, killed past their limit, or not started because marco's checkpoint couldn't be read |
+| `seek_mirror_runs_total` | `result`: `ok`, `error`, `timeout` | Mirrors of marco's checkpoint |
 | `process_*` | | RSS, CPU, open fds |
 
 ## Alerts
