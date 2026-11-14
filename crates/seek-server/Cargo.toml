@@ -1,0 +1,63 @@
+[package]
+name = "seek-server"
+version.workspace = true
+edition = "2021"
+description = "seek: the actor typeahead pod (bsky.Service/SearchActorsTypeahead over the index artifact, logged in through marco) and the builder that publishes the artifact"
+license = "MIT"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "seek"
+path = "src/main.rs"
+
+[features]
+default = ["jemalloc"]
+# jemalloc as the allocator, with the heap sampler /debug/pprof/heap reads (as marco)
+jemalloc = ["marco-ops/jemalloc"]
+
+[dependencies]
+seek-core = { workspace = true }
+seek-api = { workspace = true }
+marco-proto = { workspace = true, features = ["client"] }
+marco-ops = { workspace = true }
+vlatproto = { workspace = true }
+anyhow = { workspace = true }
+arc-swap = { workspace = true }
+axum = { workspace = true, features = ["http1", "http2", "tokio", "query"] }
+buffa = { workspace = true }
+bytes = "1"
+clap = { workspace = true, features = ["env"] }
+connectrpc = { workspace = true, features = ["axum", "client", "json", "gzip", "zstd"] }
+futures = { workspace = true }
+hickory-resolver = { workspace = true }
+http = { workspace = true }
+libc = { workspace = true }
+moka = { workspace = true }
+object_store = { workspace = true }
+prometheus = { workspace = true, features = ["process"] }
+rayon = { workspace = true }
+reqwest = { workspace = true }
+rustc-hash = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "fs", "io-util", "process"] }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt", "json", "env-filter"] }
+webpki-roots = { workspace = true }
+xxhash-rust = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+marco-server = { workspace = true }
+marco-core = { workspace = true }
+seek-api = { workspace = true, features = ["client"] }
+tempfile = { workspace = true }

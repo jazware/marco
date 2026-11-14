@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+// The one method of the reference AppView's dataplane (bluesky-social/atproto,
+// packages/bsky/proto/bsky.proto, MIT) that seek serves: the actor typeahead
+// skeleton. Package, service, method and every field number are as there, so
+// an AppView's dataplane client calls seek over gRPC, or Connect, unchanged.
+// Only these messages are copied; the rest of bsky.Service isn't served.
+package bsky;
+
+option go_package = "./;bsky";
+
+// Shared params for typeahead-style searches, which aren't paginated.
+message SearchTypeaheadParams {
+  string query = 1;
+  string viewer = 2;
+  int32 limit = 3;
+}
+
+message SearchActorResult {
+  string did = 1;
+  double score = 2;
+}
+
+message SearchActorsTypeaheadRequest {
+  SearchTypeaheadParams params = 1;
+}
+
+message SearchActorsTypeaheadResponse {
+  repeated SearchActorResult actors = 1;
+}
+
+service Service {
+  rpc SearchActorsTypeahead(SearchActorsTypeaheadRequest) returns (SearchActorsTypeaheadResponse);
+}

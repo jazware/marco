@@ -1,7 +1,8 @@
 name: Image
 
-# Builds each arch natively on its own runner and pushes it by digest, then
-# the merge job tags one manifest list over both.
+# Builds each image (marco, and seek from the same Dockerfile's seek target)
+# for each arch natively on its own runner and pushes it by digest, then the
+# merge job tags one manifest list per image over both arches.
 
 on:
   push:
@@ -20,22 +21,28 @@ concurrency:
 
 jobs:
   build:
-    name: build ${{ matrix.arch }}
+    name: build ${{ matrix.image }} ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
+        image: [marco, seek]
+        arch: [amd64, arm64]
         include:
           - arch: amd64
             runner: ubuntu-24.04
           - arch: arm64
             runner: ubuntu-24.04-arm
+          - image: marco
+            target: runtime
+          - image: seek
+            target: seek
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Image name and revision
         run: |
-          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${{ matrix.image }}" >> "$GITHUB_ENV"
           echo "GIT_REV=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
           # Releases get the dist profile (fat LTO, one codegen unit:
           # Cargo.toml); main's images stay on release, which builds in a
@@ -63,6 +70,7 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
+          target: ${{ matrix.target }}
           platforms: linux/${{ matrix.arch }}
           build-args: |
             CARGO_PROFILE=${{ env.CARGO_PROFILE }}
@@ -73,8 +81,8 @@ jobs:
           provenance: mode=max
           sbom: true
           # per profile, so a release's layers don't evict main's
-          cache-from: type=gha,scope=${{ matrix.arch }}-${{ env.CARGO_PROFILE }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}-${{ env.CARGO_PROFILE }}
+          cache-from: type=gha,scope=${{ matrix.arch }}-${{ env.CARGO_PROFILE }}-${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}-${{ env.CARGO_PROFILE }}-${{ matrix.image }}
 
       - name: Export digest
         run: |
@@ -84,24 +92,28 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: digest-${{ matrix.arch }}
+          name: digest-${{ matrix.image }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
 
   merge:
-    name: manifest list
+    name: manifest list ${{ matrix.image }}
     needs: build
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [marco, seek]
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: ${{ runner.temp }}/digests
-          pattern: digest-*
+          pattern: digest-${{ matrix.image }}-*
           merge-multiple: true
 
       - name: Image name
-        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${{ matrix.image }}" >> "$GITHUB_ENV"
 
       # main → main, sha-<7>; vX.Y.Z → X.Y.Z, X.Y, latest (and sha-<7>)
       - id: meta

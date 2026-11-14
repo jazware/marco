@@ -97,11 +97,12 @@ tools:
         (cd ui && npm ci)
     fi
 
-gen_dirs := "crates/marco-proto/src/gen ui/src/gen"
+gen_dirs := "crates/marco-proto/src/gen ui/src/gen crates/seek-api/src/gen"
 
 # Regenerate the API code from proto/
 gen: tools
     cd proto && buf lint && buf generate
+    cd crates/seek-api/proto && buf lint && buf generate
 
 # Fail if the generated code is stale: regenerate it and compare
 check-gen: tools
@@ -111,6 +112,7 @@ check-gen: tools
     trap 'rm -rf "$tmp"' EXIT
     for d in {{gen_dirs}}; do mkdir -p "$tmp/$d" && cp -R "$d/." "$tmp/$d"; done
     (cd proto && buf lint && buf generate)
+    (cd crates/seek-api/proto && buf lint && buf generate)
     for d in {{gen_dirs}}; do diff -r "$tmp/$d" "$d"; done
 
 # The server on a snapshot (see marco serve --help)

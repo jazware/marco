@@ -48,10 +48,27 @@ ARG MARCO_COMMIT=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    MARCO_COMMIT=$MARCO_COMMIT cargo build --profile "$CARGO_PROFILE" --locked -p marco-server -p marco-load \
-    && mkdir -p /out \
+    MARCO_COMMIT=$MARCO_COMMIT cargo build --profile "$CARGO_PROFILE" --locked -p marco-server -p marco-load -p seek-server \
+    && mkdir -p /out /out-seek \
     && cp target/$CARGO_PROFILE/marco target/$CARGO_PROFILE/marco-load /out/ \
-    && /out/marco --help >/dev/null
+    && cp target/$CARGO_PROFILE/seek /out-seek/ \
+    && /out/marco --help >/dev/null && /out-seek/seek --help >/dev/null
+
+# --- seek: docker build --target seek -t seek:local . --------------------------
+FROM debian:bookworm-slim AS seek
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 seek \
+    && useradd --system --uid 10001 --gid seek --home-dir /var/lib/seek --create-home seek
+USER seek:seek
+WORKDIR /var/lib/seek
+ENV SEEK_LISTEN=0.0.0.0:7310 SEEK_OPS_LISTEN=0.0.0.0:7311 SEEK_DATA=/var/lib/seek
+# 7310: bsky.Service/SearchActorsTypeahead, /healthz, /readyz; 7311: /metrics, /debug
+EXPOSE 7310 7311
+ENTRYPOINT ["/usr/bin/tini", "--", "seek"]
+CMD ["--help"]
+COPY --from=build /out-seek/ /usr/local/bin/
 
 # --- runtime ------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime

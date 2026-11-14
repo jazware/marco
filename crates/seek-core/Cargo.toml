@@ -1,0 +1,22 @@
+[package]
+name = "seek-core"
+version.workspace = true
+edition = "2021"
+description = "seek's index: folding, keys, the front-coded prefix index with top lists, the artifact it lives in, the live overlay and the ranking"
+license = "MIT"
+publish = false
+
+[dependencies]
+marco-core = { workspace = true }
+anyhow = { workspace = true }
+bytemuck = { workspace = true }
+memmap2 = { workspace = true }
+rayon = { workspace = true }
+rustc-hash = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+unicode-normalization = { workspace = true }
+xxhash-rust = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

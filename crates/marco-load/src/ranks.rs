@@ -260,6 +260,30 @@ mod tests {
         assert_eq!(got[3].rank, 0.1);
     }
 
+    /// seek-core reads this file (crates/seek-core/testdata/marco.ranks): a format change here
+    /// fails until both sides agree. `UPDATE_GOLDEN=1` rewrites it.
+    #[test]
+    fn writes_the_file_seek_reads() {
+        let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("../seek-core/testdata/marco.ranks");
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("g.ranks");
+        let h = Header {
+            created_ms: 1,
+            iterations: 15,
+            converged: true,
+            damping: 0.85,
+            max_pass: 1000.0,
+            ..Default::default()
+        };
+        write(&p, &h, &mut rows()).unwrap();
+        let got = std::fs::read(&p).unwrap();
+        if std::env::var_os("UPDATE_GOLDEN").is_some() {
+            std::fs::create_dir_all(golden.parent().unwrap()).unwrap();
+            std::fs::write(&golden, &got).unwrap();
+        }
+        assert_eq!(got, std::fs::read(&golden).unwrap());
+    }
+
     #[test]
     fn refuses_damage() {
         let dir = tempfile::tempdir().unwrap();
