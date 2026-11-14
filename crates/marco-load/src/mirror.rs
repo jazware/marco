@@ -50,6 +50,17 @@ struct LeaseResp {
     files: Vec<FileInfo>,
 }
 
+/// A name the manifest could have written: no path separator, nothing hidden or relative, so a
+/// joined path stays inside the mirror.
+fn safe_name(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= 255
+        && !n.starts_with('.')
+        && n != "current"
+        && !n.starts_with("snap-")
+        && n.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+}
+
 fn sum_of(p: &Path) -> Result<u64> {
     use std::io::Read;
     let mut f = std::fs::File::open(p)?;
@@ -79,7 +90,11 @@ async fn sync(a: &Args) -> Result<Value> {
     let t0 = Instant::now();
     let token = a.token_file.as_ref().map(std::fs::read_to_string).transpose()?.map(|t| t.trim().to_string());
     let base = a.url.trim_end_matches('/').to_string();
-    let c = reqwest::Client::builder().build()?;
+    // a hung marco can't hold a mirror forever: the builder that runs this also kills it past a limit
+    let c = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(120))
+        .build()?;
     let auth = |r: reqwest::RequestBuilder| match &token {
         Some(t) => r.bearer_auth(t),
         None => r,
@@ -96,6 +111,10 @@ async fn sync(a: &Args) -> Result<Value> {
         .context("GET /admin/checkpoint")?
         .json()
         .await?;
+    if let Some(f) = lr.files.iter().find(|f| !safe_name(&f.name)) {
+        let _ = auth(c.delete(format!("{base}/admin/checkpoint?lease={}", lr.lease))).send().await;
+        bail!("the server named a file {:?}: not a plain name in the mirror", f.name);
+    }
     let files_dir = a.dir.join("files");
     std::fs::create_dir_all(&files_dir)?;
     let r = fetch(&c, &auth, &base, &lr, &files_dir).await;
@@ -198,4 +217,83 @@ async fn fetch(
         fetched += 1;
     }
     Ok((fetched, bytes, resumed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn names() {
+        assert!(safe_name("shard-0001.marco") && safe_name("directory.marco"));
+        for bad in ["", "../x", "a/b", ".x", "current", "snap-3", "a b"] {
+            assert!(!safe_name(bad), "{bad}");
+        }
+    }
+
+    /// A mirror of an in-process marco: the first sync copies it all and opens as the same graph,
+    /// a second fetches nothing, and one after a checkpoint fetches only what it wrote.
+    #[test]
+    fn mirrors_a_running_marco() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let snap = dir.path().join("snap");
+        marco_server::synth::write(&snap, 300, 4).unwrap();
+        let token = dir.path().join("export-token");
+        std::fs::write(&token, "export-token-0123456789").unwrap();
+        let (app, addr) = rt.block_on(async {
+            let auth = marco_server::auth::AuthConfig {
+                export_token: Some("export-token-0123456789".into()),
+                ..Default::default()
+            };
+            let app = marco_server::app::App::open(marco_server::app::Config {
+                auth,
+                ..marco_server::app::Config::new(snap.clone())
+            })
+            .unwrap();
+            let ui = Arc::new(marco_server::ui::Ui::load(None).unwrap());
+            let (_api, admin) = marco_server::serve(app.clone(), ui).await.unwrap();
+            (app, admin)
+        });
+        let args = |dir: &Path| Args {
+            url: format!("http://{addr}"),
+            token_file: Some(token.clone()),
+            dir: dir.to_path_buf(),
+            lease_seconds: 60,
+            peek: false,
+        };
+        let m = dir.path().join("mirror");
+        let first = rt.block_on(sync(&args(&m))).unwrap();
+        assert_eq!(first["fetched"], first["files"]);
+        let g = marco_core::Graph::open(&m.join("current")).unwrap();
+        let orig = marco_core::Graph::open(&snap).unwrap();
+        let d = marco_server::synth::did(1);
+        let ins = |g: &marco_core::Graph| g.read(|cx| g.in_list(cx, 0, &d, 1_000_000, None)).unwrap().0;
+        assert_eq!(ins(&g), ins(&orig));
+        let again = rt.block_on(sync(&args(&m))).unwrap();
+        assert_eq!(again["fetched"], 0);
+        assert_eq!(again["bytes_fetched"], 0);
+        rt.block_on(async {
+            let ops = vec![marco_server::app::Op::Add {
+                uri: format!("at://{}/app.bsky.graph.follow/3lzzzzzzzzzz2", marco_server::synth::did(7)),
+                subject: d.clone(),
+                list: None,
+                time_us: marco_server::app::now_ms() * 1000,
+            }];
+            app.apply(&ops, "t1").await.unwrap();
+            app.checkpoint().await.unwrap();
+        });
+        let third = rt.block_on(sync(&args(&m))).unwrap();
+        assert!(third["fetched"].as_u64().unwrap() >= 1);
+        assert!(third["bytes_fetched"].as_u64().unwrap() < first["bytes_fetched"].as_u64().unwrap());
+        let g = marco_core::Graph::open(&m.join("current")).unwrap();
+        assert!(ins(&g).contains(&marco_server::synth::did(7)));
+        // a snapshot dir per checkpoint, the old one gone
+        let snaps = std::fs::read_dir(&m)
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("snap-"))
+            .count();
+        assert_eq!(snaps, 1);
+    }
 }

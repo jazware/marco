@@ -441,6 +441,8 @@ impl Index {
         if ix.ranks().len() != n as usize
             || ix.foff().len() != n as usize + 1
             || r.plc.len != n_plc as usize * PACKED
+            || n_plc > n
+            || radix_bits > 28
             || ix.ooff().len() != (n - n_plc) as usize + 1
             || ix.radix().len() != (1usize << radix_bits) + 1
             || ix.post().len() as u64 != ix.meta.keys
@@ -696,21 +698,23 @@ impl Index {
     }
 
     /// Exact handle matches of `q`: the postings at the start of its range whose key is `q`.
-    pub fn exact_handles(&self, q: &[u8], lo: usize, hi: usize, mut f: impl FnMut(u32)) {
+    /// Calls `f` on the postings at the start of the range whose handle key is `q`, until it has
+    /// accepted 256: only what `f` accepts counts, so lookalikes it turns down can't crowd out
+    /// the real handle.
+    pub fn exact_handles(&self, q: &[u8], lo: usize, hi: usize, mut f: impl FnMut(u32) -> bool) {
         if lo >= hi {
             return;
         }
         let post = self.post();
-        let mut seen = 0;
+        let mut taken = 0;
         self.walk(lo / BLOCK, |i, k| {
             if i < lo {
                 return true;
             }
-            if i >= hi || k != q || tier(post[i]) != HANDLE || seen >= 256 {
+            if i >= hi || k != q || tier(post[i]) != HANDLE || taken >= 256 {
                 return false;
             }
-            seen += 1;
-            f(post[i]);
+            taken += f(post[i]) as usize;
             true
         });
     }
@@ -842,7 +846,10 @@ pub mod tests {
         let jay = fold("jay.example.com");
         let (lo, hi) = ix.range(jay.as_bytes());
         let mut ex = Vec::new();
-        ix.exact_handles(jay.as_bytes(), lo, hi, |p| ex.push(handle_of(&ix, &ps, p)));
+        ix.exact_handles(jay.as_bytes(), lo, hi, |p| {
+            ex.push(handle_of(&ix, &ps, p));
+            true
+        });
         assert_eq!(ex, vec!["jay.example.com"]);
         assert!(ix.top(b"a").is_none());
         // the forward table gives each actor its keys back

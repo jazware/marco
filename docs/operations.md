@@ -98,6 +98,7 @@ console's Settings page shows each one's value and where it came from.
 | `--admin-operators` | `MARCO_ADMIN_OPERATORS` | | The logins the header may name, comma-separated. |
 | `--proxy-protocol-from` | `MARCO_PROXY_PROTOCOL_FROM` | | Addresses (CIDRs) whose connections start with a PROXY v2 header naming the caller. |
 | `--admin-proxy-peers` | `MARCO_ADMIN_PROXY_PEERS` | | The callers (TLV `0xE0`) whose header login is believed, comma-separated. |
+| `--export-token-file` | `MARCO_EXPORT_TOKEN_FILE` | | A token (16 characters at least, not the admin token) good for the checkpoint export alone: `/admin/checkpoint` and its files. Anywhere else on the admin listener it's a 403. |
 | `--jetstream URL` | `MARCO_JETSTREAM` | | Follow a Jetstream instance. |
 | `--jetstream-v2 URL` | `MARCO_JETSTREAM_V2` | | Follow a Jetstream v2 instance (`subscribeEvents`) by seq. Conflicts with `--jetstream` and `--firehose`. |
 | `--firehose URL` | `MARCO_FIREHOSE` | | Follow a relay's `subscribeRepos`. Conflicts with `--jetstream` and `--jetstream-v2`. |
@@ -221,7 +222,9 @@ Grafana dashboard yet.
 
 Another process can copy the current checkpoint while marco keeps serving, checkpointing and
 compacting: seek's builder mirrors it to run PageRank, and it seeds a replica or takes a backup the
-same way. All of it is on the admin listener, behind the token.
+same way. All of it is on the admin listener, behind the admin token, a proxy login, or the
+export token (`--export-token-file`), which opens the export and nothing else. At most 4 leases
+and 8 file streams run at once; past that a call gets 429.
 
 | Call | What it does |
 |---|---|

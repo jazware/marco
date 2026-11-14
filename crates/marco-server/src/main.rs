@@ -78,6 +78,11 @@ struct Serve {
         requires = "proxy_protocol_from"
     )]
     admin_proxy_peers: Vec<String>,
+    /// A file holding a token (16 characters at least) that opens the checkpoint export
+    /// (/admin/checkpoint) and nothing else on the admin listener: for a mirror, such as seek's
+    /// builder, that shouldn't hold the admin token.
+    #[arg(long, env = "MARCO_EXPORT_TOKEN_FILE")]
+    export_token_file: Option<PathBuf>,
     /// With --compact-min, a list's delta merges past this share of its base.
     #[arg(long, env = "MARCO_MERGE_RATIO", default_value_t = 0.125)]
     merge_ratio: f64,
@@ -185,6 +190,7 @@ fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
         ("admin_operators", list(&s.admin_operators)),
         ("proxy_protocol_from", list(&s.proxy_protocol_from)),
         ("admin_proxy_peers", list(&s.admin_proxy_peers)),
+        ("export_token_file", s.export_token_file.as_ref().map_or("—".into(), |p| p.display().to_string())),
         ("merge_ratio", s.merge_ratio.to_string()),
         ("compact_min", s.compact_min.to_string()),
         ("trace_ratio", s.trace_ratio.to_string()),
@@ -258,6 +264,20 @@ fn auth(s: &Serve) -> Result<AuthConfig> {
         }
         None => None,
     };
+    let export_token = match &s.export_token_file {
+        Some(p) => {
+            let t = std::fs::read_to_string(p).with_context(|| format!("--export-token-file {}", p.display()))?;
+            let t = t.trim().to_string();
+            if t.len() < 16 {
+                bail!("--export-token-file {}: the token needs at least 16 characters", p.display());
+            }
+            if token.as_deref() == Some(t.as_str()) {
+                bail!("--export-token-file must differ from --admin-token-file");
+            }
+            Some(t)
+        }
+        None => None,
+    };
     let proxy_header = match &s.admin_proxy_header {
         Some(h) => {
             if s.admin_proxy_from.is_empty() || s.admin_operators.is_empty() {
@@ -275,6 +295,7 @@ fn auth(s: &Serve) -> Result<AuthConfig> {
         operators: s.admin_operators.clone(),
         proxy_protocol_from: cidrs(&s.proxy_protocol_from)?,
         proxy_peers: s.admin_proxy_peers.clone(),
+        export_token,
     })
 }
 

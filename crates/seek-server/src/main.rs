@@ -176,9 +176,10 @@ enum Cmd {
         marco_token_file: Option<PathBuf>,
         #[arg(long, env = "SEEK_MARCO_LOAD", default_value = "marco-load")]
         marco_load: PathBuf,
-        /// PageRank's source: csr-inset (~25 GB peak on the whole network, a warm run ~20 s) or
-        /// inset (~10 GB, ~45 s).
-        #[arg(long, env = "SEEK_PAGERANK_SOURCE", default_value = "csr-inset")]
+        /// PageRank's source: inset (iterates over the mirror's in sets, ~10 GB peak on the whole
+        /// network) or csr-inset (an in-edge CSR first: about twice as fast, ~27 GB peak, so a ~45 GB
+        /// builder).
+        #[arg(long, env = "SEEK_PAGERANK_SOURCE", default_value = "inset")]
         pagerank_source: String,
         /// PageRank's snapshot cache (MARCO_MEMORY).
         #[arg(long, env = "SEEK_PAGERANK_MEMORY", default_value = "16GiB")]
@@ -466,15 +467,17 @@ async fn run(cli: Cli) -> Result<()> {
                     (None, Some(_)) => Some(builder::RanksSource::Path(dir.join("ranks"))),
                     (None, None) => None,
                 },
-                pagerank: marco_admin.map(|u| builder::Pagerank {
-                    marco_admin: u,
-                    token_file: marco_token_file,
-                    marco_load,
-                    mirror: dir.join("mirror"),
-                    ranks_dir: dir.join("ranks"),
-                    source: pagerank_source,
-                    memory: pagerank_memory,
-                    running: Default::default(),
+                pagerank: marco_admin.map(|u| {
+                    Arc::new(builder::Pagerank {
+                        marco_admin: u,
+                        token_file: marco_token_file,
+                        marco_load,
+                        mirror: dir.join("mirror"),
+                        ranks_dir: dir.join("ranks"),
+                        source: pagerank_source,
+                        memory: pagerank_memory,
+                        running: Default::default(),
+                    })
                 }),
                 without_ranks,
             };

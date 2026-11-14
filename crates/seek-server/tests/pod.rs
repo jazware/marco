@@ -100,6 +100,15 @@ struct Pods {
 }
 
 async fn pod(marco_addr: Option<std::net::SocketAddr>, art_dir: &std::path::Path, viewer_deadline: Duration) -> Pods {
+    pod_with(marco_addr, art_dir, viewer_deadline, Duration::from_secs(300)).await
+}
+
+async fn pod_with(
+    marco_addr: Option<std::net::SocketAddr>,
+    art_dir: &std::path::Path,
+    viewer_deadline: Duration,
+    max_lag: Duration,
+) -> Pods {
     seek_server::metrics::init();
     std::fs::create_dir_all(art_dir).unwrap();
     let m = marco_addr
@@ -110,7 +119,7 @@ async fn pod(marco_addr: Option<std::net::SocketAddr>, art_dir: &std::path::Path
         viewer_cache_bytes: 1 << 20,
         viewer_idle: Duration::from_secs(60),
         replay_keep: Duration::from_secs(3600),
-        max_lag: Duration::from_secs(300),
+        max_lag,
         viewer_deadline,
     };
     let pod = Pod::new(cfg, m);
@@ -253,4 +262,57 @@ async fn pod_against_marco() {
     ] {
         assert!(text.contains(m), "{m} missing");
     }
+}
+
+async fn send(p: &Pods, dir: &std::path::Path, cursor: u64) -> String {
+    tokio::time::sleep(Duration::from_millis(3)).await;
+    let mut st = state(cursor);
+    let out = builder::build(&mut st, Some(&ranks(dir)), IndexSet::Profiles, dir).unwrap();
+    p.art.send((out.path.clone(), out.meta.version.clone())).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    out.meta.version
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn swap_guards_and_lag() {
+    let (maddr, _mdir) = marco().await;
+    let dir = tempfile::tempdir().unwrap();
+    let p = pod_with(Some(maddr), dir.path(), Duration::from_secs(5), Duration::from_secs(1)).await;
+    ready(&p).await;
+    let first = p.pod.current().unwrap().version.clone();
+    let start = p.pod.current().unwrap().index.meta.cursor_us;
+    let refused = |r: &str| seek_server::metrics::REFUSED.with_label_values(&[r]).get();
+
+    // newer, but from before what the pod has replayed since it started: refused
+    let u0 = refused("uncovered");
+    send(&p, dir.path(), start - 1_000_000).await;
+    assert_eq!(p.pod.current().unwrap().version, first);
+    assert_eq!(refused("uncovered"), u0 + 1);
+
+    // a replay gap: not serving, and only an artifact past the gap is taken
+    let gap_at = now_us();
+    p.js.send(Ev::Gap { asked_us: start, first_us: gap_at }).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!p.pod.readiness().0);
+    let g0 = refused("gap");
+    send(&p, dir.path(), gap_at - 1).await;
+    assert_eq!(refused("gap"), g0 + 1);
+    assert_eq!(p.pod.current().unwrap().version, first);
+    let v = send(&p, dir.path(), gap_at + 1).await;
+    assert_eq!(p.pod.current().unwrap().version, v);
+    p.js.send(Ev::Profile { did: did(V), time_us: now_us(), name: Some("Viewer".into()), deleted: false })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(p.pod.readiness().0, "{}", p.pod.readiness().1);
+
+    // Jetstream silent past --max-lag-seconds: not ready, saying why; an event brings it back
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let (ok, why) = p.pod.readiness();
+    assert!(!ok && why.contains("behind or silent"), "{why}");
+    p.js.send(Ev::Profile { did: did(V), time_us: now_us(), name: Some("Viewer".into()), deleted: false })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(p.pod.readiness().0, "{}", p.pod.readiness().1);
 }

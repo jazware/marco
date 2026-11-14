@@ -40,4 +40,5 @@ xxhash-rust = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+marco-server = { workspace = true }
 axum = { workspace = true }

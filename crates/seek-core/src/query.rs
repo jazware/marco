@@ -156,9 +156,11 @@ pub fn parts(base: &Index, ov: &Overlay, viewer: Option<&Viewer>, qq: &Query, wa
     if qq.exact != 0 {
         base.exact_handles(q, lo, hi, |post| {
             let id = actor(post);
-            if !ov.shadows(id) && !gone(id) && base.handle_hash(id) == qq.exact {
+            let ok = !ov.shadows(id) && !gone(id) && base.handle_hash(id) == qq.exact;
+            if ok {
                 out.exact.push(Hit { id, score: EXACT + cx.score(post), exact: true, followed: cx.followed(id) });
             }
+            ok
         });
         for post in ov.exact_handles(q) {
             let id = actor(post);
@@ -290,6 +292,7 @@ mod tests {
         // something that folds the same isn't exact
         let near = search(&ix, &ov, None, "jay-example.com", 10, &p);
         assert!(near.iter().all(|h| !h.exact), "{near:?}");
+
         assert!(q("").is_empty());
         assert!(q("zz").is_empty());
     }

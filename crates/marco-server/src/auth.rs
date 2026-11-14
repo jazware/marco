@@ -28,6 +28,9 @@ pub struct AuthConfig {
     pub proxy_protocol_from: Vec<Cidr>,
     /// When set, the header login is believed only from these callers.
     pub proxy_peers: Vec<String>,
+    /// A token that opens the checkpoint export and nothing else (seek's builder mirroring it):
+    /// anywhere else on the admin listener it's refused.
+    pub export_token: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -75,6 +78,8 @@ impl Cidr {
 pub enum Caller {
     Token,
     Proxy(String),
+    /// The export token, good on the checkpoint export alone.
+    Export,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -96,6 +101,10 @@ pub fn identify(
     caller: Option<&str>,
 ) -> Result<Option<Caller>, Refusal> {
     if let Some(v) = headers.get(header::AUTHORIZATION) {
+        let got = v.to_str().ok().and_then(|s| s.strip_prefix("Bearer ")).unwrap_or("").trim();
+        if cfg.export_token.as_deref().is_some_and(|t| eq_ct(got.as_bytes(), t.as_bytes())) {
+            return Ok(Some(Caller::Export));
+        }
         let Some(want) = &cfg.token else {
             return Err(Refusal::unauthenticated("this marco has no --admin-token-file"));
         };
@@ -128,6 +137,11 @@ pub fn identify(
         return Err(Refusal::denied(&format!("{login:?} isn't an operator here")));
     }
     Ok(Some(Caller::Proxy(login.to_string())))
+}
+
+/// The checkpoint export's paths (export.rs).
+pub fn is_export(path: &str) -> bool {
+    path == "/admin/checkpoint" || path.starts_with("/admin/checkpoint/files/")
 }
 
 pub struct Refusal {
@@ -205,6 +219,9 @@ pub async fn gate(
         Err(r) if needs || path == "/marco.v1.Admin/GetSession" => return r.into_response(connect),
         Err(_) => None,
     };
+    if caller == Some(Caller::Export) && !(kind == Listener::Admin && is_export(&path)) {
+        return Refusal::denied("the export token opens /admin/checkpoint alone").into_response(connect);
+    }
     // The console's page and assets carry no data, so a link to them is fine;
     // the RPCs and ops routes it then calls are what a login must guard.
     let guarded =
@@ -227,4 +244,22 @@ pub async fn gate(
         req.extensions_mut().insert(c);
     }
     next.run(req).await
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    #[test]
+    fn the_export_token_is_its_own() {
+        let cfg = AuthConfig { export_token: Some("export-token-0123456789".into()), ..Default::default() };
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, "Bearer export-token-0123456789".parse().unwrap());
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(identify(&cfg, Listener::Admin, &h, ip, None).ok().flatten(), Some(Caller::Export));
+        h.insert(header::AUTHORIZATION, "Bearer nope".parse().unwrap());
+        assert!(identify(&cfg, Listener::Admin, &h, ip, None).is_err());
+        assert!(is_export("/admin/checkpoint") && is_export("/admin/checkpoint/files/a.marco"));
+        assert!(!is_export("/admin/checkpointx") && !is_export("/metrics") && !is_export("/admin/"));
+    }
 }

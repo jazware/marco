@@ -231,7 +231,7 @@ impl svc::Admin for AdminApi {
         let (auth, operator) = match ctx.extensions().get::<Caller>() {
             Some(Caller::Token) => ("token", String::new()),
             Some(Caller::Proxy(l)) => ("proxy", l.clone()),
-            None => ("", String::new()),
+            Some(Caller::Export) | None => ("", String::new()),
         };
         Response::ok(GetSessionResponse { auth: auth.into(), operator, ..Default::default() })
     }

@@ -82,6 +82,7 @@ pub struct State {
 }
 
 const STATE_MAGIC: &[u8; 8] = b"seekstat";
+const NO_RANKS: &str = "no ranks yet";
 const STATE_VERSION: u32 = 1;
 
 impl State {
@@ -494,7 +495,7 @@ pub struct Config {
     pub recheck: Duration,
     pub bucket: Option<Bucket>,
     pub ranks: Option<RanksSource>,
-    pub pagerank: Option<Pagerank>,
+    pub pagerank: Option<Arc<Pagerank>>,
     /// Publish with every rank 0 and no takedowns from marco (tests, first runs on a fresh graph).
     pub without_ranks: bool,
 }
@@ -508,7 +509,7 @@ pub struct Pagerank {
     pub marco_load: PathBuf,
     pub mirror: PathBuf,
     pub ranks_dir: PathBuf,
-    /// `marco-load pagerank`'s source: csr-inset (~25 GB peak on the whole network) or inset (~10 GB).
+    /// `marco-load pagerank`'s source: inset (~10 GB peak on the whole network) or csr-inset (~27 GB, about twice as fast).
     pub source: String,
     pub memory: String,
     pub running: Arc<std::sync::atomic::AtomicBool>,
@@ -516,14 +517,38 @@ pub struct Pagerank {
 
 impl Pagerank {
     /// Starts mirror then PageRank in the background when marco has a checkpoint the mirror
-    /// doesn't; a run in progress makes it a no-op.
-    pub async fn maybe_start(&self) -> Result<()> {
+    /// doesn't; a run in progress makes it a no-op. Nothing here blocks a cycle: the peek runs
+    /// in its own task with a deadline, and each subprocess is killed past its limit.
+    pub fn maybe_start(self: &Arc<Self>) {
         use std::sync::atomic::Ordering;
-        if self.running.load(Ordering::Relaxed) {
-            return Ok(());
+        if self.running.swap(true, Ordering::AcqRel) {
+            return;
         }
-        let mut req =
-            reqwest::Client::new().get(format!("{}/admin/checkpoint?peek=1", self.marco_admin.trim_end_matches('/')));
+        let me = self.clone();
+        tokio::spawn(async move {
+            // whatever happens below, the next cycle may start a run
+            struct Done(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    self.0.store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
+            let _done = Done(me.running.clone());
+            match me.peek().await {
+                Ok(true) => me.mirror_and_rank().await,
+                Ok(false) => {}
+                Err(e) => {
+                    PR_RUNS.with_label_values(&["unreachable"]).inc();
+                    tracing::warn!(error = %format!("{e:#}"), "marco's checkpoint unreadable: no new PageRank this cycle");
+                }
+            }
+        });
+    }
+
+    /// Whether marco has a checkpoint the mirror lacks (or there are no ranks yet).
+    async fn peek(&self) -> Result<bool> {
+        let c = reqwest::Client::builder().connect_timeout(Duration::from_secs(5)).timeout(PEEK_TIMEOUT).build()?;
+        let mut req = c.get(format!("{}/admin/checkpoint?peek=1", self.marco_admin.trim_end_matches('/')));
         if let Some(t) = &self.token_file {
             req = req.bearer_auth(std::fs::read_to_string(t)?.trim());
         }
@@ -532,54 +557,65 @@ impl Pagerank {
         let ours = std::fs::read_link(self.mirror.join("current"))
             .ok()
             .and_then(|t| t.to_str()?.strip_prefix("snap-")?.parse::<u64>().ok());
-        let have_ranks = self.ranks_dir.join("latest.ranks").exists();
-        if ours == Some(theirs) && have_ranks {
-            return Ok(());
+        Ok(ours != Some(theirs) || !self.ranks_dir.join("latest.ranks").exists())
+    }
+
+    async fn mirror_and_rank(&self) {
+        let t = Instant::now();
+        let mut m = tokio::process::Command::new(&self.marco_load);
+        m.args(["mirror", "--url", &self.marco_admin, "--dir"]).arg(&self.mirror);
+        if let Some(t) = &self.token_file {
+            m.arg("--token-file").arg(t);
         }
-        self.running.store(true, Ordering::Relaxed);
-        let (ml, url, tok, mirror, ranks, src, mem, running) = (
-            self.marco_load.clone(),
-            self.marco_admin.clone(),
-            self.token_file.clone(),
-            self.mirror.clone(),
-            self.ranks_dir.clone(),
-            self.source.clone(),
-            self.memory.clone(),
-            self.running.clone(),
-        );
-        tokio::spawn(async move {
-            let t = Instant::now();
-            let mut m = tokio::process::Command::new(&ml);
-            m.args(["mirror", "--url", &url, "--dir"]).arg(&mirror);
-            if let Some(t) = &tok {
-                m.arg("--token-file").arg(t);
-            }
-            let ok = match m.status().await {
-                Ok(s) if s.success() => {
-                    STEP_LAST.with_label_values(&["mirror"]).set(t.elapsed().as_secs_f64());
-                    let tp = Instant::now();
-                    let r = tokio::process::Command::new(&ml)
-                        .env("MARCO_MEMORY", &mem)
-                        .args(["pagerank", "--source", &src, "--snapshot"])
-                        .arg(mirror.join("current"))
-                        .arg("--out-dir")
-                        .arg(&ranks)
-                        .status()
-                        .await;
-                    PR_SECONDS.set(tp.elapsed().as_secs_f64());
-                    STEP_SECONDS.with(&["pagerank"]).since(tp);
-                    matches!(r, Ok(s) if s.success())
-                }
-                other => {
-                    tracing::error!(status = ?other, "marco-load mirror failed");
-                    false
-                }
-            };
-            PR_RUNS.with_label_values(&[if ok { "ok" } else { "error" }]).inc();
-            tracing::info!(ok, secs = t.elapsed().as_secs_f64(), "mirror and pagerank done");
-            running.store(false, Ordering::Relaxed);
-        });
-        Ok(())
+        let r = run_limited(m, MIRROR_LIMIT).await;
+        MIRROR_RUNS.with_label_values(&[r]).inc();
+        STEP_LAST.with_label_values(&["mirror"]).set(t.elapsed().as_secs_f64());
+        STEP_SECONDS.with(&["mirror"]).since(t);
+        if r != "ok" {
+            tracing::error!(result = r, secs = t.elapsed().as_secs_f64(), "marco-load mirror failed");
+            PR_RUNS.with_label_values(&["error"]).inc();
+            return;
+        }
+        let tp = Instant::now();
+        let mut p = tokio::process::Command::new(&self.marco_load);
+        p.env("MARCO_MEMORY", &self.memory)
+            .args(["pagerank", "--source", &self.source, "--snapshot"])
+            .arg(self.mirror.join("current"))
+            .arg("--out-dir")
+            .arg(&self.ranks_dir);
+        let r = run_limited(p, PAGERANK_LIMIT).await;
+        PR_SECONDS.set(tp.elapsed().as_secs_f64());
+        STEP_SECONDS.with(&["pagerank"]).since(tp);
+        STEP_LAST.with_label_values(&["pagerank"]).set(tp.elapsed().as_secs_f64());
+        PR_RUNS.with_label_values(&[r]).inc();
+        tracing::info!(result = r, secs = t.elapsed().as_secs_f64(), "mirror and pagerank done");
+    }
+}
+
+/// The marco checkpoint peek's deadline, connect included.
+const PEEK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Past these, the subprocess is killed: a first mirror moves ~47 GB at marco's background pace
+/// (~4 min); PageRank over the in sets is ~2 minutes on the whole network.
+pub const MIRROR_LIMIT: Duration = Duration::from_secs(3 * 3600);
+pub const PAGERANK_LIMIT: Duration = Duration::from_secs(2 * 3600);
+
+/// Runs `cmd` to its end or kills it at `limit`: "ok", "error" or "timeout".
+pub async fn run_limited(mut cmd: tokio::process::Command, limit: Duration) -> &'static str {
+    cmd.kill_on_drop(true);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "couldn't start marco-load");
+            return "error";
+        }
+    };
+    match tokio::time::timeout(limit, child.wait()).await {
+        Ok(Ok(s)) if s.success() => "ok",
+        Ok(_) => "error",
+        Err(_) => {
+            let _ = child.kill().await;
+            "timeout"
+        }
     }
 }
 
@@ -632,6 +668,11 @@ pub async fn run(
                 p.latest = Some(latest);
                 p.last_error = None;
             }
+            // the first PageRank on a fresh mirror takes a while: waiting for it isn't a failure
+            Err(e) if format!("{e}").starts_with(NO_RANKS) => {
+                tracing::info!("no ranks yet: waiting for the first PageRank before publishing");
+                published.lock().unwrap().last_error = Some(format!("{e:#}"));
+            }
             Err(e) => {
                 CYCLES.with_label_values(&["error"]).inc();
                 tracing::error!(error = %format!("{e:#}"), "cycle failed");
@@ -654,9 +695,7 @@ async fn cycle_once(
     queue: &Queue,
 ) -> Result<(PathBuf, Latest)> {
     if let Some(pr) = &cfg.pagerank {
-        if let Err(e) = pr.maybe_start().await {
-            tracing::warn!(error = %format!("{e:#}"), "marco's checkpoint unreadable: no new PageRank this cycle");
-        }
+        pr.maybe_start();
     }
     if let Some(src) = &cfg.ranks {
         let t = Instant::now();
@@ -678,7 +717,7 @@ async fn cycle_once(
     }
     // the ranks file carries marco's takedowns: a build without it would show them
     if ranks.is_none() && !cfg.without_ranks {
-        bail!("no ranks yet: the builder won't publish without marco's ranks and statuses (--without-ranks overrides)");
+        bail!("{NO_RANKS}: the builder won't publish without marco's ranks and statuses (--without-ranks overrides)");
     }
     let out = tokio::task::block_in_place(|| build(st, ranks.as_ref().map(|r| &r.0), cfg.set, art_dir))?;
     let bytes = out.stats.file_bytes;
@@ -953,5 +992,60 @@ mod tests {
         let a = s.get("did:plc:ewvi7nxzyoun6zhxrhs64oiz").unwrap();
         assert!(a.handle.is_none() && a.verified_us == 0 && a.profile);
         assert_eq!(s.cursor_us, 7);
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_subprocess_past_its_limit_is_killed() {
+        let mut c = tokio::process::Command::new("sleep");
+        c.arg("30");
+        let t = Instant::now();
+        assert_eq!(run_limited(c, Duration::from_millis(200)).await, "timeout");
+        assert!(t.elapsed() < Duration::from_secs(5));
+        assert_eq!(run_limited(tokio::process::Command::new("true"), Duration::from_secs(5)).await, "ok");
+        assert_eq!(run_limited(tokio::process::Command::new("false"), Duration::from_secs(5)).await, "error");
+    }
+
+    /// A marco admin that accepts and never answers: the peek gives up, `running` clears.
+    #[tokio::test]
+    async fn a_hung_marco_does_not_stick() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                if let Ok((s, _)) = l.accept().await {
+                    held.push(s);
+                }
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let p = Arc::new(Pagerank {
+            marco_admin: format!("http://{addr}"),
+            token_file: None,
+            marco_load: "marco-load".into(),
+            mirror: dir.path().join("m"),
+            ranks_dir: dir.path().join("r"),
+            source: "inset".into(),
+            memory: "1GiB".into(),
+            running: Default::default(),
+        });
+        let t = Instant::now();
+        p.maybe_start();
+        assert!(t.elapsed() < Duration::from_millis(100), "the cycle doesn't wait");
+        p.maybe_start();
+        assert!(p.running.load(std::sync::atomic::Ordering::Acquire));
+        for _ in 0..400 {
+            if !p.running.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(!p.running.load(std::sync::atomic::Ordering::Acquire), "the peek gave up and cleared");
+        assert!(PR_RUNS.with_label_values(&["unreachable"]).get() >= 1);
     }
 }

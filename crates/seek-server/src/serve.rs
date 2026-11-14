@@ -219,21 +219,44 @@ impl Pod {
         VIEWER_BYTES.set(self.viewers.weighted_size() as i64);
     }
 
-    fn open_gen(next: u64, path: PathBuf, version: String) -> Result<Gen> {
-        let index = match Index::open(&path, true) {
-            Ok(i) => i,
-            Err(e) => {
-                VERIFY_FAILURES.inc();
-                REFUSED.with_label_values(&["invalid"]).inc();
+    /// Opens the artifact at `path` unless it was built before `newer_than` (ms), which is read
+    /// from its meta before anything is verified or paged in. None: refused as older.
+    fn open_gen(next: u64, path: PathBuf, version: String, newer_than: Option<i64>) -> Result<Option<Gen>> {
+        let refuse = |e: anyhow::Error| {
+            VERIFY_FAILURES.inc();
+            REFUSED.with_label_values(&["invalid"]).inc();
+            let _ = std::fs::remove_file(&path);
+            Err(e)
+        };
+        let art = match seek_core::artifact::Artifact::open(&path, false) {
+            Ok(a) => a,
+            Err(e) => return refuse(e),
+        };
+        let created = art
+            .raw("meta")
+            .ok()
+            .and_then(|m| serde_json::from_slice::<seek_core::index::Meta>(m).ok())
+            .map(|m| m.created_ms);
+        if let (Some(c), Some(cur)) = (created, newer_than) {
+            if c <= cur {
+                REFUSED.with_label_values(&["older"]).inc();
+                drop(art);
                 let _ = std::fs::remove_file(&path);
-                return Err(e);
+                return Ok(None);
             }
+        }
+        if let Err(e) = art.verify() {
+            return refuse(e);
+        }
+        let index = match Index::from_artifact(art) {
+            Ok(i) => i,
+            Err(e) => return refuse(e),
         };
         index.artifact().prefetch();
         let bytes = index.artifact().len() as u64;
         MAPPED.add(bytes as i64);
         let overlay = RwLock::new(Overlay::new(&index));
-        Ok(Gen { id: next, version, index, overlay, path, bytes })
+        Ok(Some(Gen { id: next, version, index, overlay, path, bytes }))
     }
 
     /// Serves `g`; the generation it replaces goes on a blocking thread once its last query ends,
@@ -452,9 +475,12 @@ impl Pod {
                 Some((path, version)) = art.recv() => {
                     let t = Instant::now();
                     let next = self.next_gen.fetch_add(1, Ordering::Relaxed);
-                    let opened = tokio::task::spawn_blocking(move || Pod::open_gen(next, path, version)).await;
+                    let newer_than = self.current().map(|c| c.index.meta.created_ms);
+                    let v2 = version.clone();
+                    let opened = tokio::task::spawn_blocking(move || Pod::open_gen(next, path, v2, newer_than)).await;
                     let g = match opened {
-                        Ok(Ok(g)) => g,
+                        Ok(Ok(Some(g))) => g,
+                        Ok(Ok(None)) => { tracing::warn!(version = %version, "artifact older than the one served: not swapped in"); continue }
                         Ok(Err(e)) => { tracing::error!(error = %format!("{e:#}"), "artifact refused"); continue }
                         Err(e) => { tracing::error!(error = %e, "artifact open panicked"); continue }
                     };
@@ -467,10 +493,7 @@ impl Pod {
                         ring_from = cursor;
                         let _ = s.send(cursor);
                     } else {
-                        let cur = self.current();
-                        let reason = if cur.as_ref().is_some_and(|c| g.index.meta.created_ms <= c.index.meta.created_ms) {
-                            Some("older")
-                        } else if cursor < ring_from {
+                        let reason = if cursor < ring_from {
                             Some("uncovered")
                         } else if gap_until.is_some_and(|gu| cursor < gu) {
                             Some("gap")
@@ -480,7 +503,8 @@ impl Pod {
                         if let Some(r) = reason {
                             REFUSED.with_label_values(&[r]).inc();
                             tracing::warn!(version = %g.version, cursor_us = cursor, ring_from, reason = r, "artifact not swapped in");
-                            drop(g);
+                            // its unmap and unlink go on a blocking thread, as a swapped-out one's do
+                            tokio::task::spawn_blocking(move || drop(g));
                             continue;
                         }
                         // the ring holds what happened since; replay what the artifact doesn't have

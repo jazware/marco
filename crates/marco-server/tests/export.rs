@@ -10,12 +10,13 @@ use marco_server::synth::{did, tid, uri, FOLLOW};
 
 const N: u32 = 400;
 const TOKEN: &str = "test-token-0123456789";
+const EXPORT: &str = "export-token-0123456789";
 
 async fn start() -> (std::net::SocketAddr, Arc<App>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let snap = dir.path().join("snap");
     marco_server::synth::write(&snap, N, 4).unwrap();
-    let auth = AuthConfig { token: Some(TOKEN.into()), ..Default::default() };
+    let auth = AuthConfig { token: Some(TOKEN.into()), export_token: Some(EXPORT.into()), ..Default::default() };
     let cfg =
         Config { auth, compaction: marco_core::CompactPolicy { ratio: 1.0001, min_garbage: 0 }, ..Config::new(snap) };
     let app = App::open(cfg).unwrap();
@@ -138,6 +139,69 @@ async fn a_lease_copies_one_checkpoint() {
     let text = c.get(format!("{base}/metrics")).bearer_auth(TOKEN).send().await.unwrap().text().await.unwrap();
     assert!(
         text.contains("marco_export_leases 0"),
+        "{}",
+        text.lines().filter(|l| l.contains("export")).collect::<Vec<_>>().join("\n")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_export_token_and_the_limits() {
+    let (addr, _app, _dir) = start().await;
+    let c = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    // the export token opens the export, and is refused everywhere else on the admin listener
+    let peek = c.get(format!("{base}/admin/checkpoint?peek=1")).bearer_auth(EXPORT).send().await.unwrap();
+    assert_eq!(peek.status(), 200);
+    assert_eq!(c.get(format!("{base}/metrics")).bearer_auth(EXPORT).send().await.unwrap().status(), 403);
+    let rpc = c
+        .post(format!("{base}/marco.v1.Admin/GetOverview"))
+        .bearer_auth(EXPORT)
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rpc.status(), 403);
+    assert_eq!(c.get(format!("{base}/debug/pprof/heap")).bearer_auth(EXPORT).send().await.unwrap().status(), 403);
+
+    // leases past the cap: 429, and room again after a release
+    let mut ids = Vec::new();
+    for _ in 0..marco_server::export::MAX_LEASES {
+        let l: serde_json::Value =
+            c.get(format!("{base}/admin/checkpoint")).bearer_auth(EXPORT).send().await.unwrap().json().await.unwrap();
+        ids.push(l["lease"].as_str().unwrap().to_string());
+    }
+    let over = c.get(format!("{base}/admin/checkpoint")).bearer_auth(EXPORT).send().await.unwrap();
+    assert_eq!(over.status(), 429);
+    let id = ids.pop().unwrap();
+    assert_eq!(
+        c.delete(format!("{base}/admin/checkpoint?lease={id}")).bearer_auth(EXPORT).send().await.unwrap().status(),
+        204
+    );
+    let again: serde_json::Value =
+        c.get(format!("{base}/admin/checkpoint")).bearer_auth(EXPORT).send().await.unwrap().json().await.unwrap();
+    let id = again["lease"].as_str().unwrap().to_string();
+    let name = again["files"][0]["name"].as_str().unwrap().to_string();
+    let bytes = again["files"][0]["bytes"].as_u64().unwrap();
+
+    // names that would leave the lease's directory are refused; a range past the end is 416
+    for bad in ["..%2Fmanifest.json", ".hidden", "a%2Fb"] {
+        let r =
+            c.get(format!("{base}/admin/checkpoint/files/{bad}?lease={id}")).bearer_auth(EXPORT).send().await.unwrap();
+        assert!(r.status() == 400 || r.status() == 404, "{bad}: {}", r.status());
+        assert_ne!(r.status(), 200);
+    }
+    let r = c
+        .get(format!("{base}/admin/checkpoint/files/{name}?lease={id}"))
+        .bearer_auth(EXPORT)
+        .header("range", format!("bytes={}-", bytes + 10))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 416);
+    let text = c.get(format!("{base}/metrics")).bearer_auth(TOKEN).send().await.unwrap().text().await.unwrap();
+    assert!(
+        text.contains(r#"marco_export_refused_total{reason="leases"} 1"#),
         "{}",
         text.lines().filter(|l| l.contains("export")).collect::<Vec<_>>().join("\n")
     );

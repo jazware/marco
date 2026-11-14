@@ -188,8 +188,16 @@ pub static LAST_SUCCESS: LazyLock<Gauge> =
 pub static PR_PASSES: LazyLock<IntGauge> = gauge!("seek_pagerank_passes", "The last PageRank run's passes");
 pub static PR_L1: LazyLock<Gauge> = fgauge!("seek_pagerank_l1", "The last PageRank run's final L1 change");
 pub static PR_SECONDS: LazyLock<Gauge> = fgauge!("seek_pagerank_seconds", "The last PageRank run's wall time");
-pub static PR_RUNS: LazyLock<IntCounterVec> =
-    counter_vec!("seek_pagerank_runs_total", "PageRank runs the builder started, by result", &["result"]);
+pub static PR_RUNS: LazyLock<IntCounterVec> = counter_vec!(
+    "seek_pagerank_runs_total",
+    "PageRank runs the builder started, by result (ok, error, timeout: killed past its limit, unreachable: marco's checkpoint unreadable)",
+    &["result"]
+);
+pub static MIRROR_RUNS: LazyLock<IntCounterVec> = counter_vec!(
+    "seek_mirror_runs_total",
+    "marco checkpoint mirrors the builder ran, by result (ok, error, timeout)",
+    &["result"]
+);
 pub static ARTIFACT_BYTES: LazyLock<IntGauge> = gauge!("seek_builder_artifact_bytes", "The last artifact's size");
 pub static UPLOAD_SECONDS: LazyLock<Gauge> = fgauge!("seek_builder_upload_seconds", "The last artifact's upload time");
 pub static CHECKPOINT_AGE: LazyLock<Gauge> =
@@ -253,7 +261,12 @@ pub fn init() {
     }
     for r in ["ok", "error"] {
         CYCLES.with_label_values(&[r]);
+    }
+    for r in ["ok", "error", "timeout", "unreachable"] {
         PR_RUNS.with_label_values(&[r]);
+    }
+    for r in ["ok", "error", "timeout"] {
+        MIRROR_RUNS.with_label_values(&[r]);
     }
     for s in ["known", "indexed", "handle_verified", "handle_unverified", "hidden"] {
         BUILDER_ACTORS.with_label_values(&[s]);

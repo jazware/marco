@@ -1943,6 +1943,7 @@ dependencies = [
  "libc",
  "marco-core",
  "marco-ops",
+ "marco-server",
  "prometheus",
  "rayon",
  "reqwest",
