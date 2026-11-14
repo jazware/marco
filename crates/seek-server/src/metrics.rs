@@ -34,13 +34,13 @@ macro_rules! fgauge {
 
 pub const MODES: [&str; 2] = ["logged_out", "logged_in"];
 pub const STAGES: [&str; 5] = ["viewer", "prefix", "personal", "global", "filter"];
-pub const QUERY_ERRORS: [&str; 4] = ["bad_request", "not_ready", "marco", "internal"];
+pub const QUERY_ERRORS: [&str; 5] = ["bad_request", "not_ready", "marco", "no_marco", "internal"];
 pub const MARCO_METHODS: [&str; 3] = ["filter", "list_out", "intersect"];
 pub const MARCO_ERRORS: [&str; 3] = ["timeout", "unavailable", "other"];
 pub const EVENT_KINDS: [&str; 5] = ["profile", "identity", "account", "follow", "skipped"];
 pub const VERIFY_RESULTS: [&str; 4] = ["ok", "mismatch", "error", "rate_limited"];
 pub const VERIFY_METHODS: [&str; 3] = ["dns", "well_known", "did_doc"];
-pub const BUILDER_STEPS: [&str; 7] = ["ingest", "pagerank", "ranks", "build", "verify", "upload", "state"];
+pub const BUILDER_STEPS: [&str; 8] = ["ingest", "mirror", "pagerank", "ranks", "build", "verify", "upload", "state"];
 
 // ---- queries
 pub static QUERIES: LazyLock<IntCounterVec> = counter_vec!(
@@ -65,6 +65,13 @@ pub static STAGE_SECONDS: LazyLock<Arc<Family>> = LazyLock::new(|| {
 pub static FALLBACKS: LazyLock<IntCounter> = counter!(
     "seek_query_logged_out_fallbacks_total",
     "Logged-in queries answered logged out because the viewer's follows couldn't be read"
+);
+
+pub static BLOCK_DROPPED: LazyLock<IntCounter> =
+    counter!("seek_query_blocked_total", "Candidates the block filter dropped (blocks either way, or hidden in marco)");
+pub static EXACT_KEPT: LazyLock<IntCounter> = counter!(
+    "seek_query_exact_kept_total",
+    "Exact handle matches kept on the page though the block filter would have dropped them"
 );
 
 // ---- the viewer cache
@@ -124,6 +131,19 @@ pub static STALE: LazyLock<IntGauge> = gauge!(
     "seek_refusing_stale",
     "1 while seek refuses to serve: its artifact's cursor is older than Jetstream's replay window"
 );
+pub static REFUSED: LazyLock<IntCounterVec> = counter_vec!(
+    "seek_artifact_refused_total",
+    "Artifacts not swapped in, by reason (invalid, older, uncovered: the ring can't replay from its cursor, gap)",
+    &["reason"]
+);
+pub static POLL_FAILURES: LazyLock<IntCounter> =
+    counter!("seek_artifact_poll_failures_total", "Polls of the artifact source that failed");
+pub static RING: LazyLock<IntGauge> =
+    gauge!("seek_ring_entries", "Changes kept for replay into the next artifact's overlay");
+pub static SWAP_REPLAYED: LazyLock<IntGauge> =
+    gauge!("seek_artifact_swap_replayed", "Changes the last swap replayed into the new overlay");
+pub static INGEST_PANICS: LazyLock<IntCounter> =
+    counter!("seek_ingest_panics_total", "Changes that panicked while applied (skipped; a bug)");
 pub static READY: LazyLock<IntGauge> = gauge!("seek_ready", "1 while seek serves queries (see /readyz for why not)");
 
 // ---- the overlay and Jetstream
@@ -198,6 +218,15 @@ pub fn init() {
     for k in QUERY_ERRORS {
         QUERY_ERRORS_TOTAL.with_label_values(&[k]);
     }
+    for r in ["invalid", "older", "uncovered", "gap"] {
+        REFUSED.with_label_values(&[r]);
+    }
+    LazyLock::force(&BLOCK_DROPPED);
+    LazyLock::force(&EXACT_KEPT);
+    LazyLock::force(&POLL_FAILURES);
+    LazyLock::force(&RING);
+    LazyLock::force(&SWAP_REPLAYED);
+    LazyLock::force(&INGEST_PANICS);
     for m in MARCO_METHODS {
         MARCO_SECONDS.with(&[m]);
         for k in MARCO_ERRORS {
@@ -277,6 +306,10 @@ pub struct QueryHists {
     pub mode: [Arc<Hist>; 2],
     pub stage: [Arc<Hist>; 5],
     pub marco: [Arc<Hist>; 3],
+    /// seek_queries_total by mode, then result (ok, empty, error).
+    pub queries: [[IntCounter; 3]; 2],
+    pub results: [IntCounter; 2],
+    pub errors: [IntCounter; 5],
 }
 
 impl QueryHists {
@@ -285,6 +318,15 @@ impl QueryHists {
             mode: MODES.map(|m| QUERY_SECONDS.with(&[m])),
             stage: STAGES.map(|s| STAGE_SECONDS.with(&[s])),
             marco: MARCO_METHODS.map(|m| MARCO_SECONDS.with(&[m])),
+            queries: MODES.map(|m| ["ok", "empty", "error"].map(|r| QUERIES.with_label_values(&[m, r]))),
+            results: MODES.map(|m| RESULTS.with_label_values(&[m])),
+            errors: QUERY_ERRORS.map(|k| QUERY_ERRORS_TOTAL.with_label_values(&[k])),
+        }
+    }
+
+    pub fn error(&self, kind: &str) {
+        if let Some(i) = QUERY_ERRORS.iter().position(|k| *k == kind) {
+            self.errors[i].inc();
         }
     }
 }

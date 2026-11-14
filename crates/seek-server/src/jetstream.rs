@@ -18,6 +18,8 @@ pub const OVERLAP_US: u64 = 1_000_000;
 /// A first event this far past the cursor asked for means the cursor was out of the window: the
 /// collections seek reads see several events a second network-wide.
 pub const GAP_US: u64 = 120_000_000;
+/// No event for this long and the socket is redialled.
+pub const STALL: Duration = Duration::from_secs(60);
 
 pub const PROFILE: &str = "app.bsky.actor.profile";
 pub const FOLLOW: &str = "app.bsky.graph.follow";
@@ -183,8 +185,11 @@ pub async fn run(base: String, cursor_us: u64, follows: bool, tx: mpsc::Sender<E
                 let asked = cursor;
                 let mut seen_first = false;
                 let start = std::time::Instant::now();
+                // pings keep a socket open that carries no events: only data counts as alive
+                let mut last_data = std::time::Instant::now();
                 loop {
-                    let msg = match tokio::time::timeout(Duration::from_secs(60), ws.next()).await {
+                    let left = STALL.saturating_sub(last_data.elapsed());
+                    let msg = match tokio::time::timeout(left, ws.next()).await {
                         Ok(Some(Ok(m))) => m,
                         Ok(Some(Err(e))) => {
                             tracing::warn!(error = %e, "jetstream read failed");
@@ -192,12 +197,15 @@ pub async fn run(base: String, cursor_us: u64, follows: bool, tx: mpsc::Sender<E
                         }
                         Ok(None) => break,
                         Err(_) => {
-                            tracing::warn!("jetstream stalled for 60 s");
+                            tracing::warn!(cursor_us = cursor, "no Jetstream events for 60 s: redialling");
                             break;
                         }
                     };
                     let text = match msg {
-                        Message::Text(t) => t,
+                        Message::Text(t) => {
+                            last_data = std::time::Instant::now();
+                            t
+                        }
                         Message::Close(_) => break,
                         _ => continue,
                     };

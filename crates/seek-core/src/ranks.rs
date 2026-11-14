@@ -77,17 +77,22 @@ impl RanksFile {
             max_pass: f64_at(72),
             l1: f64_at(80),
         };
-        if n_plc > n || hl > body.len() {
+        let cols = n.checked_mul(11);
+        let dids = n_plc.checked_mul(PACKED).and_then(|d| d.checked_add(hl));
+        let (Some(cols), Some(mut o)) = (cols, dids) else { bail!("bad header") };
+        if n_plc > n || hl < 104 || o > body.len() {
             bail!("bad header");
         }
-        let mut o = hl + n_plc * PACKED;
         for _ in n_plc..n {
             if o + 2 > body.len() {
                 bail!("truncated");
             }
             o += 2 + u16::from_le_bytes([b[o], b[o + 1]]) as usize;
+            if o > body.len() {
+                bail!("truncated");
+            }
         }
-        if o + n * 11 != body.len() {
+        if o.checked_add(cols) != Some(body.len()) {
             bail!("columns don't fit the file");
         }
         Ok(RanksFile { map, header, dids: hl, cols: o })

@@ -58,6 +58,7 @@ uuid = "1"
 unicode-normalization = "0.1"
 bytemuck = "1"
 memmap2 = "0.9"
+parking_lot = "0.12"
 seek-core = { path = "crates/seek-core" }
 seek-api = { path = "crates/seek-api" }
 moka = { version = "0.12", features = ["future"] }

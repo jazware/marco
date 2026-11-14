@@ -18,6 +18,7 @@ struct Actor {
     name: Vec<Key>,
     hidden: bool,
     rank: u16,
+    handle_hash: u32,
 }
 
 pub struct Overlay {
@@ -26,6 +27,7 @@ pub struct Overlay {
     new_ids: FxHashMap<DidKey, u32>,
     new_dids: Vec<DidKey>,
     keys: BTreeSet<(Box<[u8]>, u32)>,
+    key_bytes: usize,
     /// Jetstream's `time_us` of the last event applied.
     pub cursor_us: u64,
     /// Counts every change, so a reader can tell the overlay moved.
@@ -48,6 +50,7 @@ impl Overlay {
             new_ids: FxHashMap::default(),
             new_dids: Vec::new(),
             keys: BTreeSet::new(),
+            key_bytes: 0,
             cursor_us: base.meta.cursor_us,
             epoch: 0,
         }
@@ -58,7 +61,7 @@ impl Overlay {
             actors: self.actors.len(),
             new_actors: self.new_dids.len(),
             keys: self.keys.len(),
-            key_bytes: self.keys.iter().map(|(k, _)| k.len() + 40).sum(),
+            key_bytes: self.key_bytes,
         }
     }
 
@@ -86,6 +89,16 @@ impl Overlay {
         match self.actors.get(&id) {
             Some(a) => a.hidden,
             None => id < self.base_n && base.hidden(id),
+        }
+    }
+
+    /// The fingerprint of the actor's handle now (`index::handle_hash`), 0 for none.
+    #[inline]
+    pub fn handle_hash(&self, base: &Index, id: u32) -> u32 {
+        match self.actors.get(&id) {
+            Some(a) => a.handle_hash,
+            None if id < self.base_n => base.handle_hash(id),
+            None => 0,
         }
     }
 
@@ -124,12 +137,19 @@ impl Overlay {
                 let mut all: Vec<Key> = a.handle.iter().chain(&a.name).cloned().collect();
                 keys::normalise(&mut all);
                 for (k, t) in all {
-                    self.keys.remove(&(k, posting(id, t)));
+                    if self.keys.remove(&(k.clone(), posting(id, t))) {
+                        self.key_bytes -= k.len() + 40;
+                    }
                 }
                 a
             }
             None if id < self.base_n => {
-                let mut a = Actor { hidden: base.hidden(id), rank: base.rank(id), ..Default::default() };
+                let mut a = Actor {
+                    hidden: base.hidden(id),
+                    rank: base.rank(id),
+                    handle_hash: base.handle_hash(id),
+                    ..Default::default()
+                };
                 base.keys_of(id, |k, t| {
                     let side = if is_handle_tier(t) { &mut a.handle } else { &mut a.name };
                     side.push((k.into(), t));
@@ -146,7 +166,10 @@ impl Overlay {
         let mut all: Vec<Key> = a.handle.iter().chain(&a.name).cloned().collect();
         keys::normalise(&mut all);
         for (k, t) in all {
-            self.keys.insert((k, posting(id, t)));
+            let l = k.len();
+            if self.keys.insert((k, posting(id, t))) {
+                self.key_bytes += l + 40;
+            }
         }
         self.actors.insert(id, a);
         self.epoch += 1;
@@ -156,6 +179,7 @@ impl Overlay {
     pub fn set_handle(&mut self, base: &Index, did: &str, handle: Option<&str>) {
         let Some((id, mut a)) = self.take(base, did, handle.is_some()) else { return };
         a.handle.clear();
+        a.handle_hash = crate::index::handle_hash(handle.unwrap_or(""));
         if let Some(h) = handle {
             keys::handle_keys(h, &base.hosting, &mut String::new(), &mut a.handle);
         }
@@ -244,6 +268,7 @@ mod tests {
         assert_eq!(matches(&ov, "example"), vec![alice]);
         assert_eq!(ov.exact_handles(fold("zed.example.com").as_bytes()).count(), 1);
         assert_eq!(ov.handle_key(&ix, &ps[0].did).unwrap(), b"zed example com");
+        assert_eq!(ov.handle_hash(&ix, alice), crate::index::handle_hash("zed.example.com"));
 
         ov.set_handle(&ix, &ps[0].did, None);
         assert!(matches(&ov, "zed").is_empty());
@@ -266,7 +291,8 @@ mod tests {
         assert!(ov.hidden(&ix, bob));
         assert_eq!(matches(&ov, "jose"), vec![bob], "a hidden actor keeps its keys for when it's back");
         assert_eq!(ov.stats().actors, 3);
-        // every key the overlay holds belongs to an actor it speaks for
+        // every key the overlay holds belongs to an actor it speaks for, and the byte count is exact
         assert!(ov.keys.iter().all(|(_, p)| ov.actors.contains_key(&actor(*p))));
+        assert_eq!(ov.stats().key_bytes, ov.keys.iter().map(|(k, _)| k.len() + 40).sum::<usize>());
     }
 }

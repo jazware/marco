@@ -9,8 +9,8 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::fold::fold_into;
-use crate::index::{actor, base_score, tier, Index, TOP};
-use crate::keys::{cut, HANDLE, MAXK};
+use crate::index::{actor, base_score, Index, TOP};
+use crate::keys::{cut, MAXK};
 use crate::overlay::Overlay;
 
 pub const EXACT: i64 = 1 << 40;
@@ -38,11 +38,23 @@ impl Default for Params {
     }
 }
 
-/// The folded query, cut to the key length.
-pub fn prepare(q: &str) -> String {
+/// Postings a prefix with no top list may scan: only a query no fold produces gets here.
+pub const SCAN_MAX: usize = 1 << 16;
+
+/// A query: its fold, cut to the key length, and the fingerprint of the handle it would be typed
+/// out in full (0 when it can't be one).
+#[derive(Clone, Debug, Default)]
+pub struct Query {
+    pub folded: String,
+    pub exact: u32,
+}
+
+pub fn prepare(q: &str) -> Query {
+    let raw = q.trim().trim_start_matches('@').to_ascii_lowercase();
     let mut f = String::new();
-    fold_into(q.trim().trim_start_matches('@'), &mut f);
-    cut(&f).to_string()
+    fold_into(&raw, &mut f);
+    let exact = if crate::did::valid_handle(&raw) { crate::index::handle_hash(&raw) } else { 0 };
+    Query { folded: cut(&f).to_string(), exact }
 }
 
 /// The viewer's side of a logged-in query, built once per viewer and artifact: the keys of the
@@ -89,6 +101,11 @@ pub struct Parts {
     /// Postings scanned in the base (0 when a top list answered).
     pub scanned: usize,
     pub top_list: bool,
+    /// Nanoseconds in each stage: the prefix (range and exact handles), the viewer's follows, the
+    /// global fill.
+    pub prefix_ns: u64,
+    pub personal_ns: u64,
+    pub global_ns: u64,
 }
 
 struct Ctx<'a> {
@@ -121,10 +138,12 @@ impl Ctx<'_> {
     }
 }
 
-/// Candidates for folded query `q`: exact handles, the viewer's matching follows, and the best
-/// `want` others.
-pub fn parts(base: &Index, ov: &Overlay, viewer: Option<&Viewer>, q: &[u8], want: usize, p: &Params) -> Parts {
+/// Candidates for query `qq`: exact handles, the viewer's matching follows, and the best `want`
+/// others.
+pub fn parts(base: &Index, ov: &Overlay, viewer: Option<&Viewer>, qq: &Query, want: usize, p: &Params) -> Parts {
     let mut out = Parts::default();
+    let t = std::time::Instant::now();
+    let q = qq.folded.as_bytes();
     let q = if q.len() > MAXK { &q[..MAXK] } else { q };
     if q.is_empty() || want == 0 {
         return out;
@@ -133,18 +152,23 @@ pub fn parts(base: &Index, ov: &Overlay, viewer: Option<&Viewer>, q: &[u8], want
     let gone = |id: u32| ov.hidden(base, id);
     let (lo, hi) = base.range(q);
 
-    base.exact_handles(q, lo, hi, |post| {
-        let id = actor(post);
-        if !ov.shadows(id) && !gone(id) {
-            out.exact.push(Hit { id, score: EXACT + cx.score(post), exact: true, followed: cx.followed(id) });
-        }
-    });
-    for post in ov.exact_handles(q) {
-        let id = actor(post);
-        if !gone(id) {
-            out.exact.push(Hit { id, score: EXACT + cx.score(post), exact: true, followed: cx.followed(id) });
+    // an exact match is the handle itself: the folded key finds candidates, the fingerprint decides
+    if qq.exact != 0 {
+        base.exact_handles(q, lo, hi, |post| {
+            let id = actor(post);
+            if !ov.shadows(id) && !gone(id) && base.handle_hash(id) == qq.exact {
+                out.exact.push(Hit { id, score: EXACT + cx.score(post), exact: true, followed: cx.followed(id) });
+            }
+        });
+        for post in ov.exact_handles(q) {
+            let id = actor(post);
+            if !gone(id) && ov.handle_hash(base, id) == qq.exact {
+                out.exact.push(Hit { id, score: EXACT + cx.score(post), exact: true, followed: cx.followed(id) });
+            }
         }
     }
+    out.prefix_ns = t.elapsed().as_nanos() as u64;
+    let t = std::time::Instant::now();
 
     if let Some(v) = viewer {
         let at = v.keys.partition_point(|(k, _)| &**k < q);
@@ -159,12 +183,14 @@ pub fn parts(base: &Index, ov: &Overlay, viewer: Option<&Viewer>, q: &[u8], want
         }
     }
 
+    out.personal_ns = t.elapsed().as_nanos() as u64;
+    let t = std::time::Instant::now();
     let skip = |id: u32| ov.shadows(id) || gone(id) || cx.followed(id);
     let mut global: Vec<(i64, u32)> = Vec::new();
     let heavy = hi - lo > base.meta.heavy_min as usize;
     let list = if heavy { base.top(q) } else { None };
     match list {
-        Some(l) if want <= TOP / 2 => {
+        Some(l) if want <= TOP => {
             out.top_list = true;
             for &post in l {
                 if global.len() >= want {
@@ -176,6 +202,7 @@ pub fn parts(base: &Index, ov: &Overlay, viewer: Option<&Viewer>, q: &[u8], want
             }
         }
         _ => {
+            let hi = hi.min(lo + SCAN_MAX);
             out.scanned = hi - lo;
             global.extend(base.post()[lo..hi].iter().filter(|&&p| !skip(actor(p))).map(|&p| (cx.score(p), p)));
         }
@@ -187,6 +214,7 @@ pub fn parts(base: &Index, ov: &Overlay, viewer: Option<&Viewer>, q: &[u8], want
         }
     }
     out.global = best(global, want, |s, post| Hit { id: actor(post), score: s, exact: false, followed: false });
+    out.global_ns = t.elapsed().as_nanos() as u64;
     out
 }
 
@@ -225,15 +253,7 @@ pub fn merge(parts: &Parts, k: usize) -> Vec<Hit> {
 
 /// One query start to end, without the block filter: what a test or the evaluation runs.
 pub fn search(base: &Index, ov: &Overlay, viewer: Option<&Viewer>, q: &str, k: usize, p: &Params) -> Vec<Hit> {
-    let q = prepare(q);
-    merge(&parts(base, ov, viewer, q.as_bytes(), k, p), k)
-}
-
-/// Whether a posting is an exact-handle key for `q` (tests).
-pub fn is_exact(base: &Index, pos: usize, q: &[u8]) -> bool {
-    let mut b = [0u8; 256];
-    let l = base.key_at(pos, &mut b);
-    &b[..l] == q && tier(base.post()[pos]) == HANDLE
+    merge(&parts(base, ov, viewer, &prepare(q), k, p), k)
 }
 
 #[cfg(test)]
@@ -265,6 +285,11 @@ mod tests {
         assert_eq!(q("j"), vec!["bob.bsky.social", "jay.example.com", "jaybird.example.org", "mary-jane.bsky.social"]);
         // the exact handle first, whatever its rank
         assert_eq!(q("jaybird.example.org")[0], "jaybird.example.org");
+        let exact = search(&ix, &ov, None, "@Jay.Example.com", 10, &p);
+        assert!(exact[0].exact);
+        // something that folds the same isn't exact
+        let near = search(&ix, &ov, None, "jay-example.com", 10, &p);
+        assert!(near.iter().all(|h| !h.exact), "{near:?}");
         assert!(q("").is_empty());
         assert!(q("zz").is_empty());
     }
@@ -316,14 +341,16 @@ mod tests {
         let ix = build_people(&ps, &[]);
         let ov = Overlay::new(&ix);
         let q = prepare("j");
-        let pt = parts(&ix, &ov, None, q.as_bytes(), 10, &Params::default());
+        let pt = parts(&ix, &ov, None, &q, 10, &Params::default());
         assert!(pt.top_list);
         let hits = merge(&pt, 10);
         assert_eq!(hits.len(), 10);
         assert!(hits.iter().all(|h| ix.rank(h.id) >= 996));
         // the scan gives the same page
-        let pt2 = parts(&ix, &ov, None, q.as_bytes(), 100, &Params::default());
+        let pt2 = parts(&ix, &ov, None, &q, TOP + 1, &Params::default());
         assert!(!pt2.top_list && pt2.scanned == 3000);
+        let pt3 = parts(&ix, &ov, None, &q, 108, &Params::default());
+        assert!(pt3.top_list, "the API's largest page reads the list");
         assert_eq!(
             merge(&pt2, 10).iter().map(|h| h.score).collect::<Vec<_>>(),
             hits.iter().map(|h| h.score).collect::<Vec<_>>()

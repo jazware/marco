@@ -1,3 +1,7 @@
+// Copyright (c) 2022-2026 Bluesky Social PBC, and Contributors. Licensed under the MIT license
+// (https://opensource.org/licenses/MIT): these messages and the service are copied from
+// bluesky-social/atproto's packages/bsky/proto/bsky.proto.
+
 syntax = "proto3";
 
 // The one method of the reference AppView's dataplane (bluesky-social/atproto,

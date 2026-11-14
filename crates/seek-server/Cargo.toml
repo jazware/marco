@@ -36,6 +36,7 @@ hickory-resolver = { workspace = true }
 http = { workspace = true }
 libc = { workspace = true }
 moka = { workspace = true }
+parking_lot = { workspace = true }
 object_store = { workspace = true }
 prometheus = { workspace = true, features = ["process"] }
 rayon = { workspace = true }

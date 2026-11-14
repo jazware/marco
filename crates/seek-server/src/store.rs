@@ -127,6 +127,14 @@ impl Bucket {
     }
 }
 
+/// A version as a file name: letters, digits and `-`, nothing a path could make more of.
+pub fn safe_version(v: &str) -> Result<String> {
+    if v.is_empty() || v.len() > 128 || !v.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
+        bail!("artifact version {v:?} isn't a plain name");
+    }
+    Ok(v.to_string())
+}
+
 pub enum Source {
     Dir(PathBuf),
     Http { url: String, client: reqwest::Client },
@@ -164,10 +172,12 @@ impl Source {
                 if Some(version.as_str()) == have {
                     return Ok(None);
                 }
+                let version = safe_version(&version)?;
                 let to = dir.join(format!("{version}.seek"));
-                if to != target {
-                    tokio::fs::copy(&target, &to).await?;
-                }
+                let tmp = dir.join(format!("{version}.part"));
+                // a copy of its own: the pod unmaps and deletes what it serves, never the source's file
+                tokio::fs::copy(&target, &tmp).await?;
+                tokio::fs::rename(&tmp, &to).await?;
                 let bytes = std::fs::metadata(&to)?.len();
                 DOWNLOAD_BYTES.inc_by(bytes);
                 Fetched { path: to, version, bytes }
@@ -188,9 +198,9 @@ impl Source {
                     .headers()
                     .get("x-seek-version")
                     .and_then(|v| v.to_str().ok())
-                    .filter(|v| !v.is_empty() && !v.contains('/'))
                     .context("no x-seek-version header")?
                     .to_string();
+                let version = safe_version(&version)?;
                 if Some(version.as_str()) == have {
                     return Ok(None);
                 }
@@ -210,7 +220,8 @@ impl Source {
                 Fetched { path: to, version, bytes: n }
             }
             Source::S3(b) => {
-                let Some(l) = b.latest().await? else { return Ok(None) };
+                let Some(mut l) = b.latest().await? else { return Ok(None) };
+                l.version = safe_version(&l.version)?;
                 if Some(l.version.as_str()) == have {
                     return Ok(None);
                 }
@@ -223,5 +234,31 @@ impl Source {
         };
         DOWNLOAD_SECONDS.with(&[]).since(t);
         Ok(Some(f))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn versions_are_plain_names() {
+        assert!(super::safe_version("20261114T041536Z189-1794628081312952").is_ok());
+        for bad in ["", "../x", "a/b", "a.seek", "a b"] {
+            assert!(super::safe_version(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_directory_source_is_copied_not_mapped() {
+        let src = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("v1-5.seek"), b"x").unwrap();
+        std::os::unix::fs::symlink("v1-5.seek", src.path().join("latest.seek")).unwrap();
+        let s = super::Source::parse(src.path().to_str().unwrap(), None, "auto", None).unwrap();
+        let f = s.poll(None, data.path()).await.unwrap().unwrap();
+        assert_eq!(f.version, "v1-5");
+        assert_eq!(f.path, data.path().join("v1-5.seek"));
+        std::fs::remove_file(&f.path).unwrap();
+        assert!(src.path().join("v1-5.seek").exists(), "the source's file stays");
+        assert!(s.poll(Some("v1-5"), data.path()).await.unwrap().is_none());
     }
 }

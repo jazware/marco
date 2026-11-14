@@ -69,7 +69,11 @@ fn typed(ix: &Index, id: u32) -> Vec<String> {
     ix.keys_of(id, |k, t| {
         if t == seek_core::keys::HANDLE || t == seek_core::keys::NAME {
             let s = String::from_utf8_lossy(k);
-            let s = if t == seek_core::keys::HANDLE { s.split(' ').next().unwrap_or("").to_string() } else { s.to_string() };
+            let s = if t == seek_core::keys::HANDLE {
+                s.split(' ').next().unwrap_or("").to_string()
+            } else {
+                s.to_string()
+            };
             let mut acc = String::new();
             for c in s.chars().take(12) {
                 acc.push(c);
@@ -95,7 +99,12 @@ pub async fn run(a: Args) -> Result<Value> {
         qs.extend(typed(&ix, rng.below(n as u64) as u32));
     }
     let viewers: Vec<String> = match &a.viewers {
-        Some(p) => std::fs::read_to_string(p)?.lines().map(str::trim).filter(|l| l.starts_with("did:")).map(String::from).collect(),
+        Some(p) => std::fs::read_to_string(p)?
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("did:"))
+            .map(String::from)
+            .collect(),
         None => Vec::new(),
     };
     let cfg = ClientConfig::new(a.target.parse().context("--target")?).with_protocol(Protocol::Grpc);
@@ -140,7 +149,11 @@ pub async fn run(a: Args) -> Result<Value> {
             for (i, q) in vq.into_iter().enumerate() {
                 let (ns, ok) = ask(q, v.clone()).await;
                 lerrs += !ok as u64;
-                if i == 0 { first.push(ns) } else { li.push(ns) }
+                if i == 0 {
+                    first.push(ns)
+                } else {
+                    li.push(ns)
+                }
             }
         }
         out.insert(
@@ -158,5 +171,7 @@ pub async fn run(a: Args) -> Result<Value> {
         h.observe(std::hint::black_box(i & 0xffff));
     }
     let hist_ns = t.elapsed().as_nanos() as f64 / 1e7;
-    Ok(json!({"histogram_observe_ns": hist_ns, "queries": qs.len(), "viewers": viewers.len().min(a.viewer_count), "actors": n, "passes": out}))
+    Ok(
+        json!({"histogram_observe_ns": hist_ns, "queries": qs.len(), "viewers": viewers.len().min(a.viewer_count), "actors": n, "passes": out}),
+    )
 }

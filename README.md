@@ -102,12 +102,32 @@ The same pages are served at `/docs` by every `marco serve`.
 | [Rebuilding from Scylla](docs/scylla.md) | `scan-scylla`: an appview's tables to a snapshot |
 | [Operations](docs/operations.md) | Listeners, auth, flags, metrics |
 | [Sizing and performance](docs/sizing.md) | Disk, memory, read and write rates, rebuild times |
+| [seek](docs/seek.md) | The actor typeahead that calls marco: running it, flags, metrics, alerts |
 | [`crates/marco-load`](crates/marco-load/README.md) | The build input format and every loader command |
 
 The measured results are standalone pages in `docs/`: the whole-network build and reads
 (`p0-results.html`), throughput and latency (`perf.html`), durability (`p1-results.html`), lists
 (`lists-results.html`), a read mix from real app traffic (`read-mix.html`) and the Scylla rebuild
 (`scylla-results.html`).
+
+## seek
+
+seek is an actor typeahead for an AppView, in this repository because it calls marco. A builder
+keeps every actor's handle and display name and publishes one index artifact every 15 minutes, with
+PageRank over marco's follows baked in. Pods map the newest artifact, follow Jetstream and answer
+the reference AppView's `bsky.Service/SearchActorsTypeahead`. Signed in, the viewer's follows come
+first and blocks both ways are dropped. One image runs both:
+
+```bash
+docker run -v seek-builder:/var/lib/seek-builder -p 7320:7320 ghcr.io/jazware/seek \
+  builder --dir /var/lib/seek-builder --bootstrap /var/lib/seek-builder/bootstrap.jsonl.zst --cursor-us 1794628081312952 \
+  --marco-admin http://marco:7301 --marco-token-file /run/secrets/marco-admin-token
+docker run -p 7310:7310 ghcr.io/jazware/seek \
+  serve --source http://seek-builder:7320/artifact/latest --marco http://marco:7300
+```
+
+`docker build --target seek -t seek:local .` builds the image from this repository. [docs/seek.md](docs/seek.md)
+has the rest.
 
 ## The crates
 
@@ -120,6 +140,10 @@ The measured results are standalone pages in `docs/`: the whole-network build an
 | `marco-load` | The bulk loader: `build`, `scan-scylla`, `fill-scylla`, `diff`, benches |
 | `marco-harness` | Source captures, the kill test, ingest lag, Jetstream retention, perf runs |
 | `marco-ops` | `/metrics`, pprof CPU and heap profiles, the tracing switch |
+| `seek-core` | seek's index: folding, keys, the artifact, the overlay, ranking |
+| `seek-api` | seek's API: the dataplane's `bsky.Service/SearchActorsTypeahead` |
+| `seek-server` | seek, binary `seek`: the pod (`seek serve`) and the builder (`seek builder`) |
+| `seek-proto` | The design's prototype and its measurements (`docs/seek.html`) |
 
 marco builds on [vlatproto](https://github.com/jazware/vlatproto) for CBOR, CIDs, firehose frames
 and DIDs.

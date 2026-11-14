@@ -51,10 +51,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     MARCO_COMMIT=$MARCO_COMMIT cargo build --profile "$CARGO_PROFILE" --locked -p marco-server -p marco-load -p seek-server \
     && mkdir -p /out /out-seek \
     && cp target/$CARGO_PROFILE/marco target/$CARGO_PROFILE/marco-load /out/ \
-    && cp target/$CARGO_PROFILE/seek /out-seek/ \
+    && cp target/$CARGO_PROFILE/seek target/$CARGO_PROFILE/marco-load /out-seek/ \
     && /out/marco --help >/dev/null && /out-seek/seek --help >/dev/null
 
 # --- seek: docker build --target seek -t seek:local . --------------------------
+# seek (the pod and the builder) and marco-load, which the builder runs to mirror marco's checkpoint
+# and rank it.
 FROM debian:bookworm-slim AS seek
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl tini \

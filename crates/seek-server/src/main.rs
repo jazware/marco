@@ -8,10 +8,10 @@
 //! seek inspect --artifact FILE [--query Q]                          an artifact's meta, sizes and a query
 //! ```
 //!
-//! Every flag has an env var (`SEEK_*`). docs/operations-seek.md has them all, the metrics and
-//! the alerts.
+//! Every flag has an env var (`SEEK_*`). docs/seek.md has them all, the metrics and the alerts.
 
-use seek_server::{bench, builder, jetstream, marco, metrics, serve, store, verify};
+use seek_server::serve::nodelay;
+use seek_server::{bench, builder, eval, jetstream, marco, metrics, serve, store, verify};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -117,6 +117,13 @@ enum Cmd {
         /// Jetstream's replay window: an artifact whose cursor is older can't be caught up.
         #[arg(long, env = "SEEK_REPLAY_WINDOW_HOURS", default_value_t = 24.0)]
         replay_window_hours: f64,
+        /// Not ready once Jetstream is this many seconds behind, or silent this long.
+        #[arg(long, env = "SEEK_MAX_LAG_SECONDS", default_value_t = 300)]
+        max_lag_seconds: u64,
+        /// A viewer's follows and mutuals from marco, every page, within this; 0 turns follows first off
+        /// (logged-in queries are still filtered by blocks).
+        #[arg(long, env = "SEEK_VIEWER_DEADLINE_MS", default_value_t = 2000)]
+        viewer_deadline_ms: u64,
         /// Read follow records too, so a viewer's follow or unfollow drops their cache entry.
         #[arg(long, env = "SEEK_FOLLOW_EVENTS", default_value_t = true, action = clap::ArgAction::Set)]
         follow_events: bool,
@@ -141,7 +148,8 @@ enum Cmd {
         /// The Jetstream time the bootstrap is consistent with.
         #[arg(long, env = "SEEK_BOOTSTRAP_CURSOR_US")]
         cursor_us: Option<u64>,
-        /// Ranks: marco's /admin/ranks/latest, or a ranks file or directory.
+        /// Ranks: a ranks file or directory, or an HTTP URL serving one (with --ranks-token-file).
+        /// Unset with --marco-admin: DIR/ranks, which the builder's own PageRank writes.
         #[arg(long, env = "SEEK_RANKS")]
         ranks: Option<String>,
         /// marco's admin token, for --ranks over HTTP.
@@ -160,12 +168,30 @@ enum Cmd {
         verify_per_cycle: usize,
         #[arg(long, env = "SEEK_RECHECK_DAYS", default_value_t = 30)]
         recheck_days: u64,
+        /// marco's admin listener: on each new checkpoint, mirror it into DIR/mirror and run PageRank
+        /// on the mirror into DIR/ranks, which is then the ranks source.
+        #[arg(long, env = "SEEK_MARCO_ADMIN")]
+        marco_admin: Option<String>,
+        #[arg(long, env = "SEEK_MARCO_TOKEN_FILE")]
+        marco_token_file: Option<PathBuf>,
+        #[arg(long, env = "SEEK_MARCO_LOAD", default_value = "marco-load")]
+        marco_load: PathBuf,
+        /// PageRank's source: csr-inset (~25 GB peak on the whole network, a warm run ~20 s) or
+        /// inset (~10 GB, ~45 s).
+        #[arg(long, env = "SEEK_PAGERANK_SOURCE", default_value = "csr-inset")]
+        pagerank_source: String,
+        /// PageRank's snapshot cache (MARCO_MEMORY).
+        #[arg(long, env = "SEEK_PAGERANK_MEMORY", default_value = "16GiB")]
+        pagerank_memory: String,
         /// Also upload each artifact here (s3://bucket/prefix).
         #[arg(long, env = "SEEK_BUCKET")]
         bucket: Option<String>,
         /// Build once and exit (benchmarks, tests).
         #[arg(long)]
         once: bool,
+        /// Publish without ranks: every rank 0, and takedowns only from Jetstream (tests).
+        #[arg(long)]
+        without_ranks: bool,
         #[command(flatten)]
         ingest: Ingest,
         #[command(flatten)]
@@ -175,6 +201,8 @@ enum Cmd {
     },
     /// Query latency through a running pod, logged out and in, at each trace ratio.
     Bench(bench::Args),
+    /// Ranking quality on recorded mentions, searched as their author: the follows-first sweep and second degree.
+    Eval(eval::Args),
     /// An artifact's meta and section sizes, and optionally a query against it.
     Inspect {
         #[arg(long)]
@@ -289,6 +317,8 @@ async fn run(cli: Cli) -> Result<()> {
             viewer_idle_seconds,
             follows,
             replay_window_hours,
+            max_lag_seconds,
+            viewer_deadline_ms,
             follow_events,
             ingest,
             s3,
@@ -297,6 +327,16 @@ async fn run(cli: Cli) -> Result<()> {
             let _p = init_logs(&common, "seek")?;
             metrics::init();
             std::fs::create_dir_all(&data).with_context(|| format!("create {}", data.display()))?;
+            let local = std::path::Path::new(source.strip_prefix("file://").unwrap_or(&source));
+            if !source.contains("://") || source.starts_with("file://") {
+                let (d, l) = (std::fs::canonicalize(&data)?, std::fs::canonicalize(local).unwrap_or_default());
+                if l == d || l.parent() == Some(d.as_path()) {
+                    anyhow::bail!(
+                        "--data {} holds --source's files: give the pod a directory of its own",
+                        data.display()
+                    );
+                }
+            }
             // a restart's leftovers: nothing maps them now
             for e in std::fs::read_dir(&data)?.flatten() {
                 if e.file_name().to_string_lossy().ends_with(".seek")
@@ -314,6 +354,8 @@ async fn run(cli: Cli) -> Result<()> {
                 viewer_cache_bytes: viewer_cache_mb << 20,
                 viewer_idle: Duration::from_secs(viewer_idle_seconds),
                 replay_keep: Duration::from_secs(6 * 3600),
+                max_lag: Duration::from_secs(max_lag_seconds),
+                viewer_deadline: Duration::from_millis(viewer_deadline_ms),
             };
             let pod = serve::Pod::new(cfg, marco);
             let p = pod.clone();
@@ -321,7 +363,7 @@ async fn run(cli: Cli) -> Result<()> {
             let l = tokio::net::TcpListener::bind(&listen).await.with_context(|| format!("bind --listen {listen}"))?;
             let la = l.local_addr()?;
             let r = serve::api_router(&pod);
-            tokio::spawn(async move { axum::serve(l, r).await });
+            tokio::spawn(async move { axum::serve(nodelay(l), r).await });
             tracing::info!(listen = %la, ops = %oa, "seek serving");
 
             let src =
@@ -343,7 +385,10 @@ async fn run(cli: Cli) -> Result<()> {
                             }
                         }
                         Ok(None) => {}
-                        Err(e) => tracing::warn!(error = %format!("{e:#}"), "artifact poll failed"),
+                        Err(e) => {
+                            metrics::POLL_FAILURES.inc();
+                            tracing::warn!(error = %format!("{e:#}"), "artifact poll failed");
+                        }
                     }
                     tokio::time::sleep(Duration::from_secs(poll_seconds)).await;
                 }
@@ -375,6 +420,12 @@ async fn run(cli: Cli) -> Result<()> {
             recheck_days,
             bucket,
             once,
+            without_ranks,
+            marco_admin,
+            marco_token_file,
+            marco_load,
+            pagerank_source,
+            pagerank_memory,
             ingest,
             s3,
             common,
@@ -410,7 +461,22 @@ async fn run(cli: Cli) -> Result<()> {
                         store::Bucket::open(&b, s3.s3_endpoint.as_deref(), &s3.s3_region, s3.s3_credentials.as_deref())
                     })
                     .transpose()?,
-                ranks: ranks.map(|r| builder::RanksSource::parse(&r, ranks_token_file.as_deref())).transpose()?,
+                ranks: match (&ranks, &marco_admin) {
+                    (Some(r), _) => Some(builder::RanksSource::parse(r, ranks_token_file.as_deref())?),
+                    (None, Some(_)) => Some(builder::RanksSource::Path(dir.join("ranks"))),
+                    (None, None) => None,
+                },
+                pagerank: marco_admin.map(|u| builder::Pagerank {
+                    marco_admin: u,
+                    token_file: marco_token_file,
+                    marco_load,
+                    mirror: dir.join("mirror"),
+                    ranks_dir: dir.join("ranks"),
+                    source: pagerank_source,
+                    memory: pagerank_memory,
+                    running: Default::default(),
+                }),
+                without_ranks,
             };
             if once {
                 return builder::build_once(cfg, st).await;
@@ -419,7 +485,7 @@ async fn run(cli: Cli) -> Result<()> {
             let oa = ops(&common.ops_listen, Arc::new(|| {}))?;
             let l = tokio::net::TcpListener::bind(&listen).await.with_context(|| format!("bind --listen {listen}"))?;
             let r = builder::router(published.clone());
-            tokio::spawn(async move { axum::serve(l, r).await });
+            tokio::spawn(async move { axum::serve(nodelay(l), r).await });
             tracing::info!(listen = %listen, ops = %oa, "seek builder");
             let (js_tx, js_rx) = mpsc::channel(500_000);
             let js = ingest.jetstream.clone();
@@ -429,6 +495,10 @@ async fn run(cli: Cli) -> Result<()> {
             let v = Arc::new(verify::Verifier::new(&ingest.plc, ingest.plc_rate, ingest.verify_rate, ingest.insecure));
             let queue = verify::Queue::start(v, ingest.verify_workers, tx);
             builder::run(cfg, st, js_rx, vrx, queue, published).await
+        }
+        Cmd::Eval(a) => {
+            println!("{}", serde_json::to_string_pretty(&eval::run(a).await?)?);
+            Ok(())
         }
         Cmd::Bench(a) => {
             println!("{}", serde_json::to_string_pretty(&bench::run(a).await?)?);

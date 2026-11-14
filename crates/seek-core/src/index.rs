@@ -21,7 +21,8 @@ use crate::did::{self, DidKey, PACKED};
 use crate::keys::{self, Hosting, Key, HANDLE, MAXK};
 
 pub const BLOCK: usize = 16;
-pub const TOP: usize = 128;
+/// Above twice the API's largest page plus its filter margin: a heavy prefix always answers from its list.
+pub const TOP: usize = 256;
 pub const HEAVY_MIN: usize = 2048;
 const ID_BITS: u32 = 30;
 const ID_MASK: u32 = (1 << ID_BITS) - 1;
@@ -44,6 +45,15 @@ pub fn tier(p: u32) -> u8 {
 pub fn posting(id: u32, tier: u8) -> u32 {
     id | (tier as u32) << ID_BITS
 }
+/// A handle's fingerprint, kept per actor so an exact match is the handle itself, not anything
+/// that folds the same (`jane-doe.example` for `jane.doe.example`). 0 is no handle.
+pub fn handle_hash(handle: &str) -> u32 {
+    if handle.is_empty() {
+        return 0;
+    }
+    (xxhash_rust::xxh3::xxh3_64(handle.to_ascii_lowercase().as_bytes()) as u32) | 1
+}
+
 #[inline]
 pub fn base_score(rank: u16, p: u32) -> i32 {
     rank as i32 + TIER_W[tier(p) as usize]
@@ -241,6 +251,8 @@ pub fn build(path: &Path, actors: &[ActorIn<'_>], hosting: &Hosting, meta: &mut 
         }
     }
     w.section("hidden", &hidden)?;
+    let hh: Vec<u32> = actors.par_iter().map(|a| handle_hash(a.handle)).collect();
+    w.section("hhash", &hh)?;
 
     // front-coded keys, block heads, postings
     let mut heads = Vec::with_capacity(es.len() / BLOCK + 1);
@@ -358,6 +370,7 @@ struct Ranges {
     oth: R,
     rank: R,
     hidden: R,
+    hhash: R,
     blob: R,
     heads: R,
     post: R,
@@ -411,6 +424,7 @@ impl Index {
             oth: get("did.oth", 1)?,
             rank: get("rank", 2)?,
             hidden: get("hidden", 8)?,
+            hhash: get("hhash", 4)?,
             blob: get("ix.blob", 1)?,
             heads: get("ix.heads", 8)?,
             post: get("ix.post", 4)?,
@@ -435,7 +449,71 @@ impl Index {
         {
             bail!("artifact sections don't agree with its meta");
         }
+        ix.validate()?;
         Ok(ix)
+    }
+
+    /// Every offset and id in range, once at open, so no read later can index out of bounds.
+    fn validate(&self) -> Result<()> {
+        let (n, keys) = (self.n as usize, self.post().len());
+        let mono = |v: &[u32], last: usize, what: &str| -> Result<()> {
+            if v.first() != Some(&0) || v.windows(2).any(|w| w[0] > w[1]) || *v.last().unwrap() as usize != last {
+                bail!("{what} offsets aren't monotone up to {last}");
+            }
+            Ok(())
+        };
+        if self.radix_bits > 28 {
+            bail!("radix bits {}", self.radix_bits);
+        }
+        mono(self.radix(), self.n_plc as usize, "did.radix")?;
+        mono(self.ooff(), sl!(self, oth, u8).len(), "did.oth")?;
+        mono(self.foff(), keys, "fwd")?;
+        if self.post().par_iter().any(|&p| actor(p) as usize >= n) {
+            bail!("a posting names an actor past the table");
+        }
+        if self.fwd().par_iter().any(|&f| f as usize >= keys) {
+            bail!("the forward table names a posting past the index");
+        }
+        let (heads, blob) = (self.heads(), self.blob());
+        if heads.windows(2).any(|w| w[0] >= w[1]) || heads.last().is_some_and(|&h| h as usize >= blob.len()) {
+            bail!("block heads out of order or past the keys");
+        }
+        // every block's keys decode inside the blob, and each starts from its head
+        let bad = (0..heads.len()).into_par_iter().any(|b| {
+            let end = heads.get(b + 1).map_or(blob.len(), |&h| h as usize);
+            let (mut o, mut prev) = (heads[b] as usize, 0usize);
+            for i in 0..BLOCK.min(keys - b * BLOCK) {
+                if o + 2 > end {
+                    return true;
+                }
+                let (shared, len) = (blob[o] as usize, blob[o + 1] as usize);
+                if (i == 0 && shared != 0) || shared > prev || shared + len > 255 || o + 2 + len > end {
+                    return true;
+                }
+                prev = shared + len;
+                o += 2 + len;
+            }
+            false
+        });
+        if bad {
+            bail!("a key block doesn't decode");
+        }
+        let (poff, loff) = (sl!(self, poff, u32), sl!(self, loff, u32));
+        mono(poff, sl!(self, pref, u8).len(), "top.pref")?;
+        mono(loff, sl!(self, list, u32).len(), "top.list")?;
+        if poff.len() != loff.len() || sl!(self, list, u32).iter().any(|&p| actor(p) as usize >= n) {
+            bail!("top lists don't agree");
+        }
+        if sl!(self, hhash, u32).len() != n || sl!(self, hidden, u64).len() < n.div_ceil(64) {
+            bail!("per-actor sections don't cover the actors");
+        }
+        Ok(())
+    }
+
+    /// The fingerprint of the actor's handle, 0 for none.
+    #[inline]
+    pub fn handle_hash(&self, id: u32) -> u32 {
+        sl!(self, hhash, u32)[id as usize]
     }
 
     pub fn artifact(&self) -> &Artifact {
@@ -628,7 +706,7 @@ impl Index {
             if i < lo {
                 return true;
             }
-            if i >= hi || k != q || tier(post[i]) != HANDLE || seen >= 64 {
+            if i >= hi || k != q || tier(post[i]) != HANDLE || seen >= 256 {
                 return false;
             }
             seen += 1;
@@ -774,6 +852,19 @@ pub mod tests {
         ks.sort();
         assert_eq!(ks.len(), 5);
         assert!(ks.contains(&("mary jane bsky social".to_string(), HANDLE)));
+    }
+
+    #[test]
+    fn open_refuses_out_of_range_contents() {
+        let ps = people();
+        let ix = build_people(&ps, &[]);
+        let sec = ix.artifact().sections.iter().find(|s| s.name == "ix.post").unwrap().clone();
+        let mut b = ix.artifact().bytes().to_vec();
+        b[sec.off..sec.off + 4].copy_from_slice(&(1_000_000u32).to_le_bytes());
+        // the section's sum no longer matches; skip it to reach the content check
+        let a = Artifact::from_bytes(&b, false).unwrap();
+        assert!(Index::from_artifact(a).err().unwrap().to_string().contains("posting"));
+        assert_eq!(ix.handle_hash(ix.id_of(&ps[0].did).unwrap()), handle_hash("Alice.bsky.social"));
     }
 
     #[test]

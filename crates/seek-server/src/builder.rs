@@ -276,11 +276,19 @@ impl State {
             profile: serde_json::Value,
         }
         let f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-        let r = BufReader::with_capacity(4 << 20, zstd::Decoder::new(f)?);
-        let mut lines = std::io::BufRead::lines(r);
+        let mut r = BufReader::with_capacity(4 << 20, zstd::Decoder::new(f)?);
         let mut actors = Vec::new();
         loop {
-            let batch: Vec<String> = lines.by_ref().take(1 << 20).collect::<std::io::Result<_>>()?;
+            // byte-cut display names can end mid-character: lossy, not an error
+            let mut batch: Vec<String> = Vec::with_capacity(1 << 20);
+            let mut line = Vec::new();
+            while batch.len() < 1 << 20 {
+                line.clear();
+                if std::io::BufRead::read_until(&mut r, b'\n', &mut line)? == 0 {
+                    break;
+                }
+                batch.push(String::from_utf8_lossy(&line).trim_end().to_string());
+            }
             if batch.is_empty() {
                 break;
             }
@@ -486,6 +494,93 @@ pub struct Config {
     pub recheck: Duration,
     pub bucket: Option<Bucket>,
     pub ranks: Option<RanksSource>,
+    pub pagerank: Option<Pagerank>,
+    /// Publish with every rank 0 and no takedowns from marco (tests, first runs on a fresh graph).
+    pub without_ranks: bool,
+}
+
+/// PageRank in the builder: on each new marco checkpoint, mirror it (`marco-load mirror` over
+/// marco's checkpoint export) and run `marco-load pagerank` on the mirror into the ranks
+/// directory, which is then the ranks source.
+pub struct Pagerank {
+    pub marco_admin: String,
+    pub token_file: Option<PathBuf>,
+    pub marco_load: PathBuf,
+    pub mirror: PathBuf,
+    pub ranks_dir: PathBuf,
+    /// `marco-load pagerank`'s source: csr-inset (~25 GB peak on the whole network) or inset (~10 GB).
+    pub source: String,
+    pub memory: String,
+    pub running: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Pagerank {
+    /// Starts mirror then PageRank in the background when marco has a checkpoint the mirror
+    /// doesn't; a run in progress makes it a no-op.
+    pub async fn maybe_start(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.running.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let mut req =
+            reqwest::Client::new().get(format!("{}/admin/checkpoint?peek=1", self.marco_admin.trim_end_matches('/')));
+        if let Some(t) = &self.token_file {
+            req = req.bearer_auth(std::fs::read_to_string(t)?.trim());
+        }
+        let v: serde_json::Value = req.send().await?.error_for_status()?.json().await?;
+        let theirs = v["checkpoint"].as_u64().context("checkpoint")?;
+        let ours = std::fs::read_link(self.mirror.join("current"))
+            .ok()
+            .and_then(|t| t.to_str()?.strip_prefix("snap-")?.parse::<u64>().ok());
+        let have_ranks = self.ranks_dir.join("latest.ranks").exists();
+        if ours == Some(theirs) && have_ranks {
+            return Ok(());
+        }
+        self.running.store(true, Ordering::Relaxed);
+        let (ml, url, tok, mirror, ranks, src, mem, running) = (
+            self.marco_load.clone(),
+            self.marco_admin.clone(),
+            self.token_file.clone(),
+            self.mirror.clone(),
+            self.ranks_dir.clone(),
+            self.source.clone(),
+            self.memory.clone(),
+            self.running.clone(),
+        );
+        tokio::spawn(async move {
+            let t = Instant::now();
+            let mut m = tokio::process::Command::new(&ml);
+            m.args(["mirror", "--url", &url, "--dir"]).arg(&mirror);
+            if let Some(t) = &tok {
+                m.arg("--token-file").arg(t);
+            }
+            let ok = match m.status().await {
+                Ok(s) if s.success() => {
+                    STEP_LAST.with_label_values(&["mirror"]).set(t.elapsed().as_secs_f64());
+                    let tp = Instant::now();
+                    let r = tokio::process::Command::new(&ml)
+                        .env("MARCO_MEMORY", &mem)
+                        .args(["pagerank", "--source", &src, "--snapshot"])
+                        .arg(mirror.join("current"))
+                        .arg("--out-dir")
+                        .arg(&ranks)
+                        .status()
+                        .await;
+                    PR_SECONDS.set(tp.elapsed().as_secs_f64());
+                    STEP_SECONDS.with(&["pagerank"]).since(tp);
+                    matches!(r, Ok(s) if s.success())
+                }
+                other => {
+                    tracing::error!(status = ?other, "marco-load mirror failed");
+                    false
+                }
+            };
+            PR_RUNS.with_label_values(&[if ok { "ok" } else { "error" }]).inc();
+            tracing::info!(ok, secs = t.elapsed().as_secs_f64(), "mirror and pagerank done");
+            running.store(false, Ordering::Relaxed);
+        });
+        Ok(())
+    }
 }
 
 /// What `/artifact/latest` serves, updated after each cycle.
@@ -558,6 +653,11 @@ async fn cycle_once(
     cycle: u32,
     queue: &Queue,
 ) -> Result<(PathBuf, Latest)> {
+    if let Some(pr) = &cfg.pagerank {
+        if let Err(e) = pr.maybe_start().await {
+            tracing::warn!(error = %format!("{e:#}"), "marco's checkpoint unreadable: no new PageRank this cycle");
+        }
+    }
     if let Some(src) = &cfg.ranks {
         let t = Instant::now();
         match src.poll(ranks.as_ref().map(|r| r.1.as_str()), &cfg.dir).await {
@@ -575,6 +675,10 @@ async fn cycle_once(
     }
     if let Some((r, _)) = ranks {
         CHECKPOINT_AGE.set(now_secs() - r.header.created_ms as f64 / 1e3);
+    }
+    // the ranks file carries marco's takedowns: a build without it would show them
+    if ranks.is_none() && !cfg.without_ranks {
+        bail!("no ranks yet: the builder won't publish without marco's ranks and statuses (--without-ranks overrides)");
     }
     let out = tokio::task::block_in_place(|| build(st, ranks.as_ref().map(|r| &r.0), cfg.set, art_dir))?;
     let bytes = out.stats.file_bytes;
@@ -600,15 +704,26 @@ async fn cycle_once(
     if queue.len() < cfg.verify_per_cycle {
         let (rank, _) = ranks_for(st.actors.iter(), ranks.as_ref().map(|r| &r.0), st.actors.len());
         let recheck = now_us() as i64 - cfg.recheck.as_micros() as i64;
-        let mut todo: Vec<(usize, bool)> = st
-            .actors
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| a.handle.is_some() && !a.hidden && (a.verified_us == 0 || a.verified_us < recheck))
-            .map(|(i, a)| (i, a.verified_us == 0))
+        let indexed = |a: &Actor| cfg.set == IndexSet::All || a.profile;
+        // new claims first, then the highest ranked, then the oldest checks
+        let key = |i: usize| {
+            let a = &st.actors[i];
+            (a.verified_us != 0, std::cmp::Reverse(rank[i]), a.verified_us)
+        };
+        let mut todo: Vec<usize> = (0..st.actors.len())
+            .into_par_iter()
+            .filter(|&i| {
+                let a = &st.actors[i];
+                a.handle.is_some() && !a.hidden && indexed(a) && (a.verified_us == 0 || a.verified_us < recheck)
+            })
             .collect();
-        todo.sort_by_key(|&(i, new)| (!new, std::cmp::Reverse(rank[i]), st.actors[i].verified_us));
-        for (i, _) in todo.into_iter().take(cfg.verify_per_cycle - queue.len()) {
+        let take = (cfg.verify_per_cycle - queue.len()).min(todo.len());
+        if take > 0 && todo.len() > take {
+            todo.select_nth_unstable_by_key(take - 1, |&i| key(i));
+            todo.truncate(take);
+        }
+        todo.sort_unstable_by_key(|&i| key(i));
+        for i in todo {
             queue.push(&st.actors[i].did.to_did());
         }
     }

@@ -110,6 +110,27 @@ impl Marco {
         }
     }
 
+    /// How many accounts `viewer` follows that follow `candidate` (second degree).
+    pub async fn common_follows(&self, viewer: &str, candidate: &str, hists: &QueryHists) -> Result<u64> {
+        let side = |dir: Dir, actor: &str| ListSide {
+            rel: FOLLOW.into(),
+            dir: dir.into(),
+            actor: actor.into(),
+            ..Default::default()
+        };
+        let req = IntersectRequest {
+            a: side(Dir::DIR_IN, candidate).into(),
+            b: side(Dir::DIR_OUT, viewer).into(),
+            limit: 1,
+            op: SetOp::SET_OP_AND.into(),
+            count: true,
+            count_limit: 10_000,
+            ..Default::default()
+        };
+        let r = self.call(M::Intersect, hists, async { Ok(self.c.intersect(req).await?.into_owned()) }).await?;
+        Ok(r.total)
+    }
+
     /// `actors` less those who block `viewer` or whom `viewer` blocks, in order.
     pub async fn unblocked(&self, viewer: &str, actors: Vec<String>, hists: &QueryHists) -> Result<Vec<String>> {
         if actors.is_empty() {

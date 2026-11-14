@@ -2,6 +2,7 @@
 
 pub mod bench;
 pub mod builder;
+pub mod eval;
 pub mod hist;
 pub mod jetstream;
 pub mod marco;

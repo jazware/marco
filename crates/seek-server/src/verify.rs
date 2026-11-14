@@ -131,6 +131,10 @@ impl Verifier {
         let req =
             vlatproto::http::guarded(self.insecure).get(&format!("https://{handle}/.well-known/atproto-did")).ok()?;
         let resp = tokio::time::timeout(TIMEOUT, req.send()).await.ok()?.ok()?;
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            VERIFY_CHECKS.with_label_values(&["rate_limited", "well_known"]).inc();
+            return None;
+        }
         if !resp.status().is_success() {
             return None;
         }
