@@ -1,7 +1,9 @@
 # marco: a graph database for atproto actor-to-actor edges. The engine
 # (marco-core), the server (marco-server) and its API (marco-proto), the
 # built-in Jetstream and firehose consumers (marco-ingest) and their harness
-# (marco-harness), and the bulk loader (marco-load). Builds on vlatproto by path.
+# (marco-harness), and the bulk loader (marco-load). seek, the actor
+# typeahead service that calls marco, lives here too (seek-*, docs/seek.html).
+# Builds on vlatproto by path.
 [workspace]
 resolver = "2"
 members = ["crates/*"]
@@ -53,6 +55,7 @@ tikv-jemallocator = { version = "0.7", features = ["profiling", "unprefixed_mall
 jemalloc_pprof = "0.9"
 scylla = { version = "1.9.0", default-features = false }
 uuid = "1"
+unicode-normalization = "0.1"
 
 [profile.release]
 opt-level = 3

@@ -1,0 +1,17 @@
+[package]
+name = "seek-proto"
+version.workspace = true
+edition = "2021"
+description = "seek's design prototype: index build, query latency and ranking quality on a marco snapshot (docs/seek.html)"
+license = "MIT"
+publish = false
+
+[dependencies]
+marco-core = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+rayon = { workspace = true }
+serde_json = { workspace = true }
+zstd = { workspace = true }
+unicode-normalization = { workspace = true }
+tikv-jemallocator = { workspace = true }
