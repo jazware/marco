@@ -23,7 +23,7 @@ connectrpc = { version = "0.9.1", default-features = false }
 futures = { version = "0.3", default-features = false, features = ["std"] }
 http = "1"
 libc = "0.2"
-vlatproto = { git = "https://github.com/jazware/vlatproto", rev = "8fd41163c003a39ae73c568d648434ef42f32049" }
+vlatproto = { git = "https://github.com/jazware/vlatproto", rev = "b41d16a865a8dc28158c9bb7ce4e75d9ca809737" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

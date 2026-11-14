@@ -11,7 +11,14 @@ pub fn bin() -> PathBuf {
     // set when cargo builds the test, not when clippy checks it
     match option_env!("CARGO_BIN_EXE_marco-load") {
         Some(p) => PathBuf::from(p),
-        None => std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("marco-load"),
+        // cargo keeps a test's executable in the profile dir (deps/), or under build/ since 1.100,
+        // and the binary is in the profile dir either way
+        None => std::env::current_exe()
+            .unwrap()
+            .ancestors()
+            .map(|d| d.join("marco-load"))
+            .find(|p| p.is_file())
+            .expect("marco-load built beside the test"),
     }
 }
 

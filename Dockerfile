@@ -23,7 +23,7 @@ COPY docs/ /src/docs/
 RUN npm run build
 
 # --- rust release build -------------------------------------------------------
-FROM rust:1.99.0-bookworm AS build
+FROM rust:1.100.0-bookworm AS build
 
 # cmake/clang: aws-lc-sys (rustls) and the vendored libsecp256k1 / jemalloc / zstd C builds
 RUN apt-get update \
