@@ -10,7 +10,7 @@ members = ["crates/*"]
 
 # Every crate's version: a release (scripts/marco-public/release.sh) bumps it here.
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 
 [workspace.dependencies]
 marco-core = { path = "crates/marco-core", default-features = false }

@@ -1863,7 +1863,7 @@ dependencies = [
 
 [[package]]
 name = "marco-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -1883,7 +1883,7 @@ dependencies = [
 
 [[package]]
 name = "marco-harness"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "marco-ingest"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1934,7 +1934,7 @@ dependencies = [
 
 [[package]]
 name = "marco-load"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1961,7 +1961,7 @@ dependencies = [
 
 [[package]]
 name = "marco-ops"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1982,7 +1982,7 @@ dependencies = [
 
 [[package]]
 name = "marco-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "buffa",
  "connectrpc",
@@ -1992,7 +1992,7 @@ dependencies = [
 
 [[package]]
 name = "marco-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3342,7 +3342,7 @@ dependencies = [
 
 [[package]]
 name = "seek-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "buffa",
  "connectrpc",
@@ -3352,7 +3352,7 @@ dependencies = [
 
 [[package]]
 name = "seek-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -3369,7 +3369,7 @@ dependencies = [
 
 [[package]]
 name = "seek-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3383,7 +3383,7 @@ dependencies = [
 
 [[package]]
 name = "seek-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
