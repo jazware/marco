@@ -104,7 +104,13 @@ async fn sync(a: &Args) -> Result<Value> {
             auth(c.get(format!("{base}/admin/checkpoint?peek=1"))).send().await?.error_for_status()?.json().await?;
         return Ok(json!({"marco": v, "mirror": current_checkpoint(&a.dir)}));
     }
-    let lr: LeaseResp = auth(c.get(format!("{base}/admin/checkpoint?ttl={}", a.lease_seconds)))
+    // the lease answers only once marco has summed every file, minutes for a checkpoint it hasn't
+    // summed since it started, so only this call waits that long
+    let lc = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(1800))
+        .build()?;
+    let lr: LeaseResp = auth(lc.get(format!("{base}/admin/checkpoint?ttl={}", a.lease_seconds)))
         .send()
         .await?
         .error_for_status()
