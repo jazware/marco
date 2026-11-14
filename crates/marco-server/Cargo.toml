@@ -41,7 +41,10 @@ tokio = { workspace = true, features = ["rt-multi-thread", "signal", "io-util"] 
 toml = { workspace = true }
 tracing = { workspace = true }
 vlatproto = { workspace = true }
+xxhash-rust = { workspace = true }
+bytes = "1"
 
 [dev-dependencies]
+reqwest = { workspace = true }
 marco-proto = { workspace = true, features = ["client"] }
 tempfile = { workspace = true }

@@ -197,6 +197,7 @@ pub async fn gate(
                 && !(path.starts_with("/marco.v1.Graph/") && is_read(&path)))
                 || path.starts_with("/metrics")
                 || path.starts_with("/debug/")
+                || path.starts_with("/admin/checkpoint")
         }
     };
     let caller = match identify(&app.cfg.auth, kind, req.headers(), peer.addr.ip(), peer.caller.as_deref()) {
@@ -206,7 +207,8 @@ pub async fn gate(
     };
     // The console's page and assets carry no data, so a link to them is fine;
     // the RPCs and ops routes it then calls are what a login must guard.
-    let guarded = connect || path.starts_with("/metrics") || path.starts_with("/debug/");
+    let guarded =
+        connect || path.starts_with("/metrics") || path.starts_with("/debug/") || path.starts_with("/admin/checkpoint");
     if let (Some(Caller::Proxy(_)), true) = (&caller, guarded) {
         let write = !is_read(&path) && !(path.starts_with("/metrics") || req.method() == http::Method::GET);
         if !same_origin(req.headers(), write) {

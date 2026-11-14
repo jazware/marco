@@ -46,6 +46,7 @@ rewrites), and `--memory` for marco's own cache of the snapshot's pages, which i
 | Graph writes | token | token or proxy login |
 | `marco.v1.Admin` | no | token or proxy login (`GetSession` is open) |
 | `/metrics`, `/debug/*` | no | token or proxy login |
+| `/admin/checkpoint` (checkpoint export) | no | token or proxy login |
 | `/admin` (console) | no | the page is open, its data needs a login |
 | `/docs`, `/healthz`, `/readyz` | open | open |
 | `/` | the landing page and explorer | redirects to `/admin/` |
@@ -196,6 +197,9 @@ A scraper that can't send the token reads the same text from `--ops-listen`, whi
 | `marco_snapshot_bytes` | `section` | Snapshot bytes by section |
 | `marco_snapshot_seconds` | `what` | Snapshot open and write times |
 | `marco_build_info` | `version`, `commit` | 1 |
+| `marco_export_leases` | | Checkpoint export leases open |
+| `marco_export_bytes_total`, `marco_export_files_total` | | Checkpoint file bytes and file reads the export served |
+| `marco_export_hashed_bytes_total` | | Bytes read to sum checkpoint files for a lease (once per file: they never change) |
 
 What to watch:
 
@@ -212,6 +216,32 @@ A lag of a few seconds is usually the source's. In the durability tests, two pub
 differed by up to 53 s while marco's own share of the lag stayed under 205 ms, so compare against
 another instance before blaming marco ([Durability and restarts, measured](p1-results.html)). marco doesn't ship a
 Grafana dashboard yet.
+
+## Checkpoint export
+
+Another process can copy the current checkpoint while marco keeps serving, checkpointing and
+compacting: seek's builder mirrors it to run PageRank, and it seeds a replica or takes a backup the
+same way. All of it is on the admin listener, behind the token.
+
+| Call | What it does |
+|---|---|
+| `GET /admin/checkpoint?ttl=SECS` | A lease (default 1800 s, at most 6 h): the manifest, its checkpoint number, and every file it names with its bytes and xxh3 |
+| `GET /admin/checkpoint?peek=1` | The checkpoint number, build and time only, no lease |
+| `GET /admin/checkpoint/files/NAME?lease=ID` | One file, with `Range: bytes=A-` to resume |
+| `DELETE /admin/checkpoint?lease=ID` | Ends the lease |
+
+A lease hard-links the files its manifest names into `<snapshot>.export/<lease>/`, so the snapshot's
+filesystem has to allow hard links (it's the same one). A compaction or a newer checkpoint can delete
+the originals meanwhile and the copy still reads the leased checkpoint. The links go when the lease is
+deleted or its ttl passes, and a restart clears them all. Reads and sums go through `--background-io`,
+so requests go first. The first lease after a start sums every file once. A file never changes under its
+name, so later leases sum only files they haven't seen. Copied files plus the manifest are a snapshot
+directory `marco serve` or `marco-load` can open.
+
+`marco-load mirror --url ADMIN --token-file FILE --dir DIR` keeps a local copy in sync. It takes a
+lease, downloads only the files it doesn't have (each checked against its xxh3, a partial one resumed),
+links them into `DIR/snap-<checkpoint>` and points `DIR/current` at it, then drops files no snapshot
+names. The first sync copies the whole snapshot, and later ones copy what the checkpoints since wrote.
 
 ## Profiling and tracing
 

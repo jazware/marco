@@ -6,6 +6,7 @@
 pub mod admin_svc;
 pub mod app;
 pub mod auth;
+pub mod export;
 pub mod graph_svc;
 pub mod ingest;
 pub mod liststats;
@@ -79,6 +80,7 @@ pub fn admin_router(app: &Arc<App>, ui: Arc<ui::Ui>) -> axum::Router {
     };
     connect(app, true)
         .merge(marco_ops::router(Some(refresh)))
+        .merge(export::routes(app, export::Export::new(&app.cfg.snapshot)))
         .merge(ui::routes(ui))
         .route("/healthz", axum::routing::get(|| async { "ok\n" }))
         .route("/readyz", axum::routing::get(readyz).with_state(app.clone()))

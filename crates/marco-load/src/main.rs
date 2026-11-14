@@ -9,6 +9,7 @@
 //! marco-load replay --snapshot FILE --deletes DIR   delete-by-URI replay through the mutable path
 //! marco-load diff   --a SNAP --b SNAP              two snapshots compared record by record
 //! marco-load pagerank --snapshot DIR [--link DIR] --out-dir DIR   PageRank over the follows, a ranks file (daily: warm from the last)
+//! marco-load mirror --url ADMIN --dir DIR      a local copy of a running marco's checkpoint
 //! marco-load scan-scylla --config TOML --out DIR [--snapshot SNAP]   Scylla tables -> build input (-> snapshot)
 //! marco-load fill-scylla --config TOML --input DIR   build input -> Scylla tables (tests, benchmarks)
 //! marco-load scan-hubble --out DIR [--host URL] [--snapshot SNAP]   a sync-API host's repos -> build input (-> snapshot)
@@ -33,6 +34,8 @@ mod hubble;
 mod jetstream;
 mod lists_bench;
 mod metrics;
+#[cfg(feature = "hubble")]
+mod mirror;
 mod pagerank;
 mod ranks;
 mod rows;
@@ -106,6 +109,9 @@ enum Cmd {
     Diff(diff::Args),
     /// PageRank over the follow graph: the capped pass to L1 < 1e-5, warm from the last run, a DID-keyed ranks file.
     Pagerank(pagerank::Args),
+    /// Keep a local copy of a running marco's current checkpoint (its admin listener's checkpoint export).
+    #[cfg(feature = "hubble")]
+    Mirror(mirror::Args),
     /// Scan Scylla tables into build input (see the README), then optionally build.
     #[cfg(feature = "scylla")]
     ScanScylla(Box<cql::scan::Args>),
@@ -175,6 +181,8 @@ fn main() -> Result<()> {
         Cmd::Replay(a) => verify::replay(&a)?,
         Cmd::Diff(a) => diff::run(&a)?,
         Cmd::Pagerank(a) => pagerank::run(&a)?,
+        #[cfg(feature = "hubble")]
+        Cmd::Mirror(a) => mirror::run(&a)?,
         #[cfg(feature = "scylla")]
         Cmd::ScanScylla(a) => cql::scan::run(&a)?,
         #[cfg(feature = "scylla")]
