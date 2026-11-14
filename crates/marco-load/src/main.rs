@@ -8,6 +8,7 @@
 //! marco-load verify --snapshot FILE            checksums, every list decoded, a sampled export checked
 //! marco-load replay --snapshot FILE --deletes DIR   delete-by-URI replay through the mutable path
 //! marco-load diff   --a SNAP --b SNAP              two snapshots compared record by record
+//! marco-load pagerank --snapshot FILE [--warm RANKS] [--out RANKS]   PageRank over the follows
 //! marco-load scan-scylla --config TOML --out DIR [--snapshot SNAP]   Scylla tables -> build input (-> snapshot)
 //! marco-load fill-scylla --config TOML --input DIR   build input -> Scylla tables (tests, benchmarks)
 //! marco-load scan-hubble --out DIR [--host URL] [--snapshot SNAP]   a sync-API host's repos -> build input (-> snapshot)
@@ -32,6 +33,7 @@ mod hubble;
 mod jetstream;
 mod lists_bench;
 mod metrics;
+mod pagerank;
 mod rows;
 #[cfg(any(feature = "scylla", feature = "hubble"))]
 mod spill;
@@ -101,6 +103,8 @@ enum Cmd {
     Verify(verify::VerifyArgs),
     Replay(verify::ReplayArgs),
     Diff(diff::Args),
+    /// PageRank over the follow graph: CSR export, iterations to a tolerance, ranks files.
+    Pagerank(pagerank::Args),
     /// Scan Scylla tables into build input (see the README), then optionally build.
     #[cfg(feature = "scylla")]
     ScanScylla(Box<cql::scan::Args>),
@@ -169,6 +173,7 @@ fn main() -> Result<()> {
         Cmd::Verify(a) => verify::verify(&a)?,
         Cmd::Replay(a) => verify::replay(&a)?,
         Cmd::Diff(a) => diff::run(&a)?,
+        Cmd::Pagerank(a) => pagerank::run(&a)?,
         #[cfg(feature = "scylla")]
         Cmd::ScanScylla(a) => cql::scan::run(&a)?,
         #[cfg(feature = "scylla")]
