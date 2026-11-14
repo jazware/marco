@@ -13,7 +13,7 @@ scylla = ["dep:scylla", "dep:tokio", "dep:uuid", "dep:futures"]
 # scan-hubble (a sync-API host's repos over HTTP)
 hubble = ["dep:tokio", "dep:futures", "dep:reqwest"]
 # scan-jetstream (a Jetstream v2 instance's sealed archive over HTTP)
-jetstream = ["hubble", "dep:xxhash-rust"]
+jetstream = ["hubble"]
 jemalloc = ["marco-ops/jemalloc"]
 # off: marco-core without its op metrics, for the overhead bench
 metrics = ["marco-core/metrics"]
@@ -36,7 +36,7 @@ uuid = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "query"], optional = true }
 vlatproto = { workspace = true }
-xxhash-rust = { workspace = true, optional = true }
+xxhash-rust = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

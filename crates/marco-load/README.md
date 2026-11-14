@@ -19,6 +19,7 @@ marco-load diff         --a SNAP --b SNAP                two snapshots, record b
 marco-load verify       --snapshot SNAP                  checksums, every list decoded, both directions agree
 marco-load open | bench | replay                         the P0 measurements
 marco-load bench-lists  --snapshot SNAP                  list sizes, lookups, set ops, listitem writes
+marco-load pagerank     --snapshot SNAP --out-dir DIR    PageRank over the follows -> a ranks file
 ```
 
 `--ops 127.0.0.1:PORT` serves `/metrics` and `/debug/pprof/*` while any of
@@ -737,3 +738,48 @@ diffed against a direct build of the archive's events folded in the test
 the statuses and the cursor checked. Other tests cover a slice that
 straddles a unit at both ends, a pass to the new tip, a refused key and
 `--plan-only`.
+
+## PageRank
+
+`marco-load pagerank` ranks every actor in a snapshot by PageRank over its
+follows and writes a ranks file, which seek bakes into its typeahead index.
+Damping 0.85, a uniform teleport, dangling mass spread uniformly, one edge
+per (follower, subject), self-follows and taken-down or deleted accounts
+left out. What one follower passes along one edge is capped at
+`--max-pass` average ranks (default 1000, the excess to the teleport), so a
+sign-up hub followed by most of the network doesn't hand its rank to the
+few accounts it follows. It iterates until the L1 change is below `--tol`
+(1e-5), with sources renumbered by out-degree so a pass's random reads share
+cache lines.
+
+```sh
+# daily, next to a running marco: link its current checkpoint, warm-start from the last run
+marco-load pagerank --snapshot /data/snap --link /data/pr-link --out-dir /data/ranks
+```
+
+`--out-dir` warm-starts from `DIR/latest.ranks` (unless `--cold` or
+`--warm FILE`), writes `DIR/ranks-<UTC time>.ranks`, points `latest.ranks`
+at it and keeps the newest `--keep` (8). `--link DIR` hard-links the
+checkpoint's files into `DIR` (the same filesystem) and reads that, so a
+checkpoint or compaction on the live directory can't pull a file away
+mid-run. `--source inset` skips the in-edge CSR: about 10 GB peak instead of
+25 GB on the whole network, and each pass about six times slower.
+`--source csr-out --before-us T` keeps only follow records whose TID is
+older than `T`: the graph as it was, for evaluations.
+
+On the whole network (47M ids, 3.03B follows, 32 threads) a cold run takes
+34 passes and 38 s, a run warm from the day before 15 passes and 22 s.
+
+### The ranks file
+
+Little-endian, one row per actor in the snapshot's directory, keyed by DID:
+
+| Part | Bytes | |
+|---|---|---|
+| header | 128 | `mrcranks`, version 1, rows, did:plc rows, created ms, the snapshot's build and checkpoint, iterations, converged, damping, max pass, final L1, and the u16 scale's ln low and high |
+| DIDs | 15 per did:plc, then (u16 length, bytes) per other DID | did:plc packed as marco packs it, ascending, then the rest by string |
+| rank | 4 a row | f32, summing to 1 |
+| rank16 | 2 a row | ln(rank) scaled between the header's low (0) and high (65535) |
+| followers | 4 a row | distinct followers that pass rank: the in-degree a recency signal diffs |
+| flags | 1 a row | bit 0: hidden (taken down or deleted) |
+| trailer | 16 | xxh3-64 of everything before it, then `mrcranks` |
