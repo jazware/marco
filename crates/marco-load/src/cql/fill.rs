@@ -253,6 +253,9 @@ pub fn run(a: &Args) -> Result<Value> {
         None => marco_core::Relations::bsky_default(),
     };
     cfg.resolve(&relations)?;
+    if let Some(t) = cfg.tables.iter().find(|t| t.record.is_some()) {
+        bail!("table {:?} holds records, which build input doesn't: fill-scylla fills column tables only", t.name);
+    }
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async {
         let session = Arc::new(cfg.connect().await?);

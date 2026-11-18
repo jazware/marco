@@ -78,6 +78,18 @@ relation = "listitem"          # a list relation: the table needs a list column
 name = "list_items"
 subject = "subject"
 list = "list"                  # the column with the list's AT URI (default list)
+
+# listblock and modlist aren't defaults: these two need them in --relations
+
+[[table]]
+relation = "listblock"         # subjects are list URIs: the subject column holds them
+name = "listblocks"
+subject = "list"
+
+[[table]]
+relation = "modlist"           # `when` reads the record: the table names its record column
+name = "lists"
+record = "raw"                 # the record's JSON (blob or text); no subject or list column
 ```
 
 The scan needs `SELECT` on the tables, `system_schema` and `system.tablets`. Column and table
@@ -121,8 +133,9 @@ target/release/marco serve --snapshot snap-scylla --memory 3GiB --jetstream wss:
   relation's table also has the list's AT URI (the `list` column), and only a list relation's
   table may have one. For a relation whose subjects are records, the subject column holds the
   record's AT URI ([Records as subjects](relations.md#records-as-subjects)).
-- A relation with `when` or a `$self` subject can't be scanned. Its edges depend on the record
-  itself, and the scan reads columns, so the config is refused.
+- A relation with `when` or a `$self` subject needs a table that holds each record
+  ([Tables that hold the record](#tables-that-hold-the-record)), and the config is refused without
+  one.
 - The partition key comes from the schema, and the token bounds use all of its columns, so any
   partition key works.
 - The snapshot holds exactly the relations the config's tables name. A relation left out isn't in
@@ -135,6 +148,29 @@ target/release/marco serve --snapshot snap-scylla --memory 3GiB --jetstream wss:
 - Rows whose repo isn't a DID, or whose subject isn't one the relation takes, are counted and
   skipped. The whole-network run had 13
   (3 follows, 10 blocks). A row with a null column is skipped and counted as `null_rows`.
+
+### Tables that hold the record
+
+Some relations can't be read from columns. `modlist` keeps a list only while its record's
+`purpose` is a mod list, and a table that stores each list's record as JSON has no purpose column
+to read. Name that column as the table's `record`, and the scan reads `actor`, `rkey` and
+the record, puts the record's URI together (`at://<actor>/<collection>/<rkey>`) and runs it
+through the relation's rule, as the live path does with a Jetstream record. The rule reads the
+subject (and a list relation's list) from the record by the relation's own paths, so a record
+table names no `subject` or `list` column. A relation with `when` or a `$self` subject needs one.
+
+| A row whose record | |
+|---|---|
+| is an edge | written as a create, its subject the record's own URI under `$self` |
+| fails `when` (a curation or reference list) | dropped, counted as `unmatched_rows` |
+| names a list in another repo | dropped, counted as `cross_repo_rows` |
+| doesn't parse as a JSON object, or isn't an edge (a bad subject, a bad rkey) | dropped, counted as `bad_rows` |
+| is null | dropped, counted as `null_rows` |
+
+The record column is a blob or text, and the scan refuses any other type before it reads a row.
+`fill-scylla` writes column tables only, since build input holds no records. The scan keeps the
+edges a rule gave, not the records, so it resumes only under the rules it began with: change a
+record table's relation in `--relations` (its `when`, say) and it asks for `--fresh`.
 
 ### The primary key
 

@@ -39,6 +39,12 @@ pub struct State {
     /// Per table: list items skipped because their list is in another repo.
     #[serde(default)]
     pub cross_repo_rows: Vec<u64>,
+    /// Per record table: records the relation doesn't keep (`when`), and
+    /// records that don't parse or aren't an edge.
+    #[serde(default)]
+    pub unmatched_rows: Vec<u64>,
+    #[serde(default)]
+    pub bad_rows: Vec<u64>,
     pub commits: u64,
 }
 
@@ -52,6 +58,8 @@ impl State {
             row_bytes: vec![0; tables],
             null_rows: vec![0; tables],
             cross_repo_rows: vec![0; tables],
+            unmatched_rows: vec![0; tables],
+            bad_rows: vec![0; tables],
             ..Default::default()
         }
     }

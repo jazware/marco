@@ -12,14 +12,17 @@
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{bail, Context, Result};
+use marco_core::Relation;
 use scylla::client::session::Session;
 use scylla::cluster::{ClusterState, Node};
+use scylla::deserialize::value::DeserializeValue;
 use scylla::frame::response::result::TableSpec;
 use scylla::routing::Token;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::config::{Config, Table};
+use super::scan::RecordCol;
 
 /// A token interval (lo, hi]: Scylla's token() never returns i64::MIN, so
 /// (i64::MIN, i64::MAX] is the whole ring.
@@ -53,6 +56,26 @@ pub struct Plan {
     pub shards: usize,
     pub nodes: usize,
     pub ranges: Vec<Range>,
+    /// Per table, the relation a record table's rows are read by
+    /// ([`record_rules`]): the scan keeps edges, not records, so a resume
+    /// under another rule would mix the two. Empty when no table holds
+    /// records, as in a plan from before record tables.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub record_rules: Vec<Option<Relation>>,
+}
+
+/// Per table, the relation (its `when`, subject and collection) a record
+/// table's rows are read by, or None for a table read from columns, whose
+/// rows the build checks; empty when no table holds records. `defs` is one
+/// per table.
+pub fn record_rules(tables: &[Table], defs: &[Relation]) -> Vec<Option<Relation>> {
+    let rules: Vec<Option<Relation>> =
+        tables.iter().zip(defs).map(|(t, d)| t.record.as_ref().map(|_| d.clone())).collect();
+    if rules.iter().all(Option::is_none) {
+        Vec::new()
+    } else {
+        rules
+    }
 }
 
 pub fn width(p: Piece) -> u128 {
@@ -238,15 +261,30 @@ pub async fn make(session: &Session, cfg: &Config) -> Result<Plan> {
         shards: 0,
         nodes: 0,
         ranges: Vec::new(),
+        record_rules: Vec::new(),
     };
     let mut shards = std::collections::BTreeSet::new();
     for (ti, t) in cfg.tables.iter().enumerate() {
         let meta = keyspace.tables.get(&t.name).with_context(|| format!("no table {}.{}", cfg.keyspace, t.name))?;
-        for c in [&t.actor, &t.rkey, &t.subject].into_iter().chain(&t.list) {
+        let cols: Vec<&String> = match &t.record {
+            Some(rec) => vec![&t.actor, &t.rkey, rec],
+            None => [&t.actor, &t.rkey, &t.subject].into_iter().chain(&t.list).collect(),
+        };
+        for c in cols {
             if !meta.columns.contains_key(c) {
                 let mut have: Vec<&String> = meta.columns.keys().collect();
                 have.sort();
                 bail!("{}.{} has no column {c:?} (it has {have:?})", cfg.keyspace, t.name);
+            }
+        }
+        if let Some(rec) = &t.record {
+            let typ = &meta.columns[rec].typ;
+            if RecordCol::type_check(typ).is_err() {
+                bail!(
+                    "{}.{}'s record column {rec:?} is {typ:?}: a record column is blob or text",
+                    cfg.keyspace,
+                    t.name
+                );
             }
         }
         plan.partition_keys.push(meta.partition_key.clone());
@@ -283,6 +321,60 @@ pub async fn make(session: &Session, cfg: &Config) -> Result<Plan> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plan keeps the rule each record table's rows were read by, and a
+    /// changed rule (here `when`) doesn't match it; column tables keep none,
+    /// so a plan from before record tables still matches a config without
+    /// them.
+    #[test]
+    fn record_rules_pin_the_rule_a_scan_read_by() {
+        let rels = |purpose: &str| {
+            marco_core::Relations::parse_toml(&format!(
+                "[[relation]]\nname = \"follow\"\ncollection = \"app.bsky.graph.follow\"\nsubject = \"subject\"\n\n\
+                 [[relation]]\nname = \"modlist\"\ncollection = \"app.bsky.graph.list\"\nsubject = \"$self\"\n\
+                 when = {{ purpose = \"{purpose}\" }}\n"
+            ))
+            .unwrap()
+        };
+        let defs = |r: &marco_core::Relations| ["follow", "modlist"].map(|n| r.get(r.by_name(n).unwrap()).clone());
+        let table = |relation: &str, record: Option<&str>| Table {
+            relation: relation.into(),
+            name: format!("{relation}s"),
+            actor: "actor_did".into(),
+            rkey: "rkey".into(),
+            subject: "subject".into(),
+            list: None,
+            record: record.map(String::from),
+        };
+        let tables = vec![table("follow", None), table("modlist", Some("raw"))];
+        let rules = record_rules(&tables, &defs(&rels("app.bsky.graph.defs#modlist")));
+        assert_eq!(rules.len(), 2);
+        assert!(rules[0].is_none() && rules[1].as_ref().is_some_and(|r| r.name == "modlist"));
+        let other = record_rules(&tables, &defs(&rels("app.bsky.graph.defs#curatelist")));
+        assert_ne!(rules, other, "another when");
+        let plan = Plan {
+            keyspace: "bsky".into(),
+            datacenter: None,
+            tables,
+            modes: vec![],
+            keys: vec![],
+            partition_keys: vec![],
+            clustering_keys: vec![],
+            shards: 0,
+            nodes: 0,
+            ranges: vec![],
+            record_rules: rules.clone(),
+        };
+        let back: Plan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert_eq!(back.record_rules, rules);
+        // column tables alone keep none: a plan without the field reads back as one that matches
+        let cols = vec![table("follow", None)];
+        assert!(record_rules(&cols, &defs(&rels("app.bsky.graph.defs#modlist"))[..1]).is_empty());
+        let old = Plan { tables: cols, record_rules: vec![], ..plan };
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("record_rules"), "{json}");
+        assert_eq!(serde_json::from_str::<Plan>(&json).unwrap(), old);
+    }
 
     #[test]
     fn stripes_follow_the_sharding_function() {

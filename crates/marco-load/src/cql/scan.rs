@@ -15,8 +15,13 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use marco_core::relation::{json_path, Skip};
+use marco_core::Relation;
 use prometheus::{register_int_counter_vec, register_int_gauge_vec, IntCounterVec, IntGaugeVec};
 use scylla::client::session::Session;
+use scylla::deserialize::value::DeserializeValue;
+use scylla::deserialize::{DeserializationError, FrameSlice, TypeCheckError};
+use scylla::frame::response::result::{ColumnType, NativeType};
 use scylla::policies::load_balancing::{NodeIdentifier, SingleTargetLoadBalancingPolicy};
 use scylla::response::{PagingState, PagingStateResponse};
 use scylla::statement::prepared::PreparedStatement;
@@ -128,6 +133,8 @@ struct Ctx {
     cfg: Config,
     plan: Plan,
     rels: Vec<String>,
+    /// Each table's relation.
+    defs: Vec<Relation>,
     session: Session,
     stmts: Vec<PreparedStatement>,
     spill: Spill,
@@ -152,18 +159,58 @@ struct Ctx {
     stop: AtomicBool,
 }
 
+/// Rows skipped, by why.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Skipped {
+    /// A column the row needs is null.
+    nulls: u64,
+    /// A list in another repo.
+    cross_repo: u64,
+    /// A record the relation doesn't keep (`when`).
+    unmatched: u64,
+    /// A record that doesn't parse as a JSON object, or isn't an edge.
+    bad: u64,
+}
+
+impl Skipped {
+    fn add(&mut self, o: Skipped) {
+        self.nulls += o.nulls;
+        self.cross_repo += o.cross_repo;
+        self.unmatched += o.unmatched;
+        self.bad += o.bad;
+    }
+}
+
+/// A record column's bytes, from a blob or a text column.
+pub struct RecordCol<'a>(&'a [u8]);
+
+impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for RecordCol<'frame> {
+    fn type_check(typ: &ColumnType) -> Result<(), TypeCheckError> {
+        <&[u8]>::type_check(typ).or_else(|_| <&str>::type_check(typ))
+    }
+
+    fn deserialize(
+        typ: &'metadata ColumnType<'metadata>,
+        v: Option<FrameSlice<'frame>>,
+    ) -> Result<Self, DeserializationError> {
+        match typ {
+            ColumnType::Native(NativeType::Blob) => <&[u8]>::deserialize(typ, v).map(RecordCol),
+            _ => <&str>::deserialize(typ, v).map(|s| RecordCol(s.as_bytes())),
+        }
+    }
+}
+
 /// One range's rows since its last commit: whole partitions by bucket, and
 /// the partition being read.
 struct Buf {
     buckets: Vec<Vec<u8>>,
     rows: u64,
     bytes: u64,
-    nulls: u64,
-    cross_repo: u64,
+    skipped: Skipped,
     cur: Vec<u8>,
     cur_rows: Vec<(u16, u64)>,
-    /// The current partition's rows skipped: (null column, list in another repo).
-    cur_skipped: (u64, u64),
+    /// The current partition's rows skipped.
+    cur_skipped: Skipped,
     cur_token: Option<i64>,
 }
 
@@ -173,11 +220,10 @@ impl Buf {
             buckets: vec![Vec::new(); BUCKETS],
             rows: 0,
             bytes: 0,
-            nulls: 0,
-            cross_repo: 0,
+            skipped: Skipped::default(),
             cur: Vec::new(),
             cur_rows: Vec::new(),
-            cur_skipped: (0, 0),
+            cur_skipped: Skipped::default(),
             cur_token: None,
         }
     }
@@ -186,22 +232,52 @@ impl Buf {
     /// list table. Returns the bytes kept.
     fn push(&mut self, a: Option<&str>, k: Option<&str>, s: Option<&str>, list: Option<Option<&str>>) -> u64 {
         let (Some(actor), Some(rkey), Some(subject)) = (a, k, s) else {
-            self.cur_skipped.0 += 1;
+            self.cur_skipped.nulls += 1;
             return 0;
         };
         let list = match list {
             None => None,
             Some(None) => {
-                self.cur_skipped.0 += 1;
+                self.cur_skipped.nulls += 1;
                 return 0;
             }
             // the build would refuse it too: a list item counts only on its owner's list
             Some(Some(l)) if own_list(actor.as_bytes(), l.as_bytes()).is_none() => {
-                self.cur_skipped.1 += 1;
+                self.cur_skipped.cross_repo += 1;
                 return 0;
             }
             Some(Some(l)) => Some(l),
         };
+        self.put(actor, rkey, subject, list)
+    }
+
+    /// One row of a record table: the record (JSON) is an edge by its
+    /// relation's rule, read as the live path reads it, with the record's
+    /// URI from the actor and rkey columns. Returns the bytes kept.
+    fn push_record(&mut self, rel: &Relation, a: Option<&str>, k: Option<&str>, rec: Option<&[u8]>) -> u64 {
+        let (Some(actor), Some(rkey), Some(rec)) = (a, k, rec) else {
+            self.cur_skipped.nulls += 1;
+            return 0;
+        };
+        let Some(v) = serde_json::from_slice::<Value>(rec).ok().filter(Value::is_object) else {
+            self.cur_skipped.bad += 1;
+            return 0;
+        };
+        let uri = format!("at://{actor}/{}/{rkey}", rel.collection);
+        match rel.edge(&uri, |p| json_path(&v, p)) {
+            Ok(e) => self.put(actor, rkey, e.subject, e.list),
+            Err(why) => {
+                match why {
+                    Skip::Unmatched => self.cur_skipped.unmatched += 1,
+                    Skip::CrossRepo => self.cur_skipped.cross_repo += 1,
+                    _ => self.cur_skipped.bad += 1,
+                }
+                0
+            }
+        }
+    }
+
+    fn put(&mut self, actor: &str, rkey: &str, subject: &str, list: Option<&str>) -> u64 {
         put_row(&mut self.cur, actor.as_bytes(), rkey.as_bytes(), subject.as_bytes(), list.map(str::as_bytes), 0, 1);
         self.cur_rows.push((bucket_of(actor) as u16, self.cur.len() as u64));
         let n = (actor.len() + rkey.len() + subject.len() + list.map_or(0, str::len)) as u64;
@@ -218,9 +294,8 @@ impl Buf {
             at = end as usize;
         }
         self.rows += self.cur_rows.len() as u64;
-        self.nulls += self.cur_skipped.0;
-        self.cross_repo += self.cur_skipped.1;
-        self.cur_skipped = (0, 0);
+        self.skipped.add(self.cur_skipped);
+        self.cur_skipped = Skipped::default();
         self.cur.clear();
         self.cur_rows.clear();
         // a big partition's buffer isn't kept for the next: the budget counts chunks
@@ -263,8 +338,10 @@ impl Ctx {
             c.pos[ri] = pos;
             c.rows[t] += buf.rows;
             c.row_bytes[t] += buf.bytes;
-            c.null_rows[t] += buf.nulls;
-            c.cross_repo_rows[t] += buf.cross_repo;
+            c.null_rows[t] += buf.skipped.nulls;
+            c.cross_repo_rows[t] += buf.skipped.cross_repo;
+            c.unmatched_rows[t] += buf.skipped.unmatched;
+            c.bad_rows[t] += buf.skipped.bad;
             c.commits += 1;
             SPILL.with_label_values(&[&self.rels[t]]).set(c.lens[t].iter().sum::<u64>() as i64);
             c.commits
@@ -287,8 +364,7 @@ impl Ctx {
         }
         buf.rows = 0;
         buf.bytes = 0;
-        buf.nulls = 0;
-        buf.cross_repo = 0;
+        buf.skipped = Skipped::default();
         Ok(())
     }
 
@@ -384,7 +460,9 @@ impl Ctx {
         let rel = &self.rels[r.table];
         let (rows_c, bytes_c, pages_c) =
             (ROWS.with_label_values(&[rel]), BYTES.with_label_values(&[rel]), PAGES.with_label_values(&[rel]));
-        let listed = self.plan.tables[r.table].list.is_some();
+        let tb = &self.plan.tables[r.table];
+        let (listed, record) = (tb.list.is_some(), tb.record.is_some());
+        let def = &self.defs[r.table];
         let mut stmt = self.statement(r, true);
         let mut buf = Buf::new();
         for pi in start.piece as usize..r.pieces.len() {
@@ -403,7 +481,14 @@ impl Ctx {
                 pages_c.inc();
                 self.pages.fetch_add(1, Relaxed);
                 let (mut n, mut nb) = (0u64, 0u64);
-                if listed {
+                if record {
+                    for row in rows.rows::<(i64, Option<&str>, Option<&str>, Option<RecordCol>)>()? {
+                        let (tok, a, k, rec) = row?;
+                        n += 1;
+                        self.boundary(ri, pi, &mut buf, tok)?;
+                        nb += buf.push_record(def, a, k, rec.map(|r| r.0));
+                    }
+                } else if listed {
                     for row in rows.rows::<(i64, Option<&str>, Option<&str>, Option<&str>, Option<&str>)>()? {
                         let (tok, a, k, s, l) = row?;
                         n += 1;
@@ -469,12 +554,15 @@ fn select(plan: &Plan, t: usize, bypass: bool) -> String {
     let tb = &plan.tables[t];
     let pk: Vec<String> = plan.partition_keys[t].iter().map(|c| ident(c)).collect();
     let tok = format!("token({})", pk.join(", "));
-    let list = tb.list.as_deref().map_or(String::new(), |l| format!(", {}", ident(l)));
+    // a record table's subject and list are in its record
+    let rest = match &tb.record {
+        Some(rec) => ident(rec),
+        None => ident(&tb.subject) + &tb.list.as_deref().map_or(String::new(), |l| format!(", {}", ident(l))),
+    };
     format!(
-        "SELECT {tok}, {}, {}, {}{list} FROM {}.{} WHERE {tok} > ? AND {tok} <= ?{}",
+        "SELECT {tok}, {}, {}, {rest} FROM {}.{} WHERE {tok} > ? AND {tok} <= ?{}",
         ident(&tb.actor),
         ident(&tb.rkey),
-        ident(&tb.subject),
         ident(&plan.keyspace),
         ident(&tb.name),
         if bypass { " BYPASS CACHE" } else { "" }
@@ -520,10 +608,11 @@ pub fn run(a: &Args) -> Result<Value> {
     // the snapshot holds the relations scanned (a list relation's companion
     // too), in the config's order: one left out would be empty and then
     // half-filled by the catch-up
-    let scanned = rels.iter().filter_map(|r| relations.by_name(r)).map(|id| relations.get(id).clone()).collect();
-    let relations = marco_core::Relations::new(scanned)?;
+    let defs: Vec<Relation> =
+        rels.iter().filter_map(|r| relations.by_name(r)).map(|id| relations.get(id).clone()).collect();
+    let relations = marco_core::Relations::new(defs.clone())?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let mut report = rt.block_on(scan(a, cfg, rels.clone()))?;
+    let mut report = rt.block_on(scan(a, cfg, rels.clone(), defs))?;
     drop(rt);
     marco_core::store::write_atomic(&a.out, RELATIONS, toml::to_string(&relations)?.as_bytes(), true)?;
     if let Some(snap) = &a.snapshot {
@@ -537,7 +626,7 @@ pub fn run(a: &Args) -> Result<Value> {
     Ok(report)
 }
 
-async fn scan(a: &Args, cfg: Config, rels: Vec<String>) -> Result<Value> {
+async fn scan(a: &Args, cfg: Config, rels: Vec<String>, defs: Vec<Relation>) -> Result<Value> {
     let dir = &a.out;
     // a file per bucket per table stays open, past the usual soft limit of 1024
     let nofile = sys::raise_nofile();
@@ -554,6 +643,13 @@ async fn scan(a: &Args, cfg: Config, rels: Vec<String>) -> Result<Value> {
             if plan.keyspace != cfg.keyspace || plan.tables != cfg.tables {
                 bail!("{} holds a scan of other tables; --fresh to start over", dir.display());
             }
+            // a record table's rows were kept or dropped by its relation's rule
+            if plan.record_rules != plan::record_rules(&plan.tables, &defs) {
+                bail!(
+                    "{} holds a scan whose record tables were read by other relation rules (--relations); --fresh to start over",
+                    dir.display()
+                );
+            }
             if plan.datacenter != cfg.datacenter {
                 bail!(
                     "{} holds a scan of datacenter {:?}, the config says {:?}; --fresh to start over",
@@ -566,7 +662,9 @@ async fn scan(a: &Args, cfg: Config, rels: Vec<String>) -> Result<Value> {
                 bail!("{}: the scan state doesn't match its plan; --fresh to start over", dir.display());
             }
             let mut st = st;
-            st.cross_repo_rows.resize(plan.tables.len(), 0);
+            for v in [&mut st.cross_repo_rows, &mut st.unmatched_rows, &mut st.bad_rows] {
+                v.resize(plan.tables.len(), 0);
+            }
             eprintln!(
                 "resuming the scan in {} (begun {:.1} h ago, {:.1}% of tokens done)",
                 dir.display(),
@@ -581,7 +679,8 @@ async fn scan(a: &Args, cfg: Config, rels: Vec<String>) -> Result<Value> {
             }
             // the start comes before the plan: every row read is newer than it
             let started = now_us();
-            let plan = plan::make(&session, &cfg).await?;
+            let mut plan = plan::make(&session, &cfg).await?;
+            plan.record_rules = plan::record_rules(&plan.tables, &defs);
             marco_core::store::write_atomic(dir, PLAN, &serde_json::to_vec(&plan)?, true)?;
             let st = State::new(plan.ranges.len(), plan.tables.len(), started);
             st.write(dir)?;
@@ -642,7 +741,8 @@ async fn scan(a: &Args, cfg: Config, rels: Vec<String>) -> Result<Value> {
     let already_done = total - queues.values().map(|q| q.len()).sum::<usize>();
     let finished_before = state.finished_us.is_some();
     let workers = queues.len() * cfg.in_flight_per_shard;
-    let row_bytes = ROW_BYTES + if plan.tables.iter().any(|t| t.list.is_some()) { LIST_BYTES } else { 0 };
+    let uris = defs.iter().any(|r| r.list.is_some() || r.subject_records().is_some());
+    let row_bytes = ROW_BYTES + if uris { LIST_BYTES } else { 0 };
     // a worker's buckets, their slack, and the compressed frames: ~3 bytes per row byte
     let budget_rows = ((a.memory_gb * 1e9) as usize / (workers.max(1) * 3 * row_bytes)).max(1024);
     let chunk_rows = a.chunk_rows.clamp(1, budget_rows);
@@ -661,6 +761,7 @@ async fn scan(a: &Args, cfg: Config, rels: Vec<String>) -> Result<Value> {
         commit: Mutex::new(state),
         plan,
         rels: rels.clone(),
+        defs,
         session,
         stmts,
         spill,
@@ -821,6 +922,8 @@ async fn scan(a: &Args, cfg: Config, rels: Vec<String>) -> Result<Value> {
                 "rows": st.rows[t],
                 "null_rows": st.null_rows[t],
                 "cross_repo_rows": st.cross_repo_rows[t],
+                "unmatched_rows": st.unmatched_rows[t],
+                "bad_rows": st.bad_rows[t],
                 "row_bytes": st.row_bytes[t],
                 "spill_bytes": st.lens[t].iter().sum::<u64>(),
             })
@@ -838,6 +941,12 @@ async fn scan(a: &Args, cfg: Config, rels: Vec<String>) -> Result<Value> {
             eprintln!(
                 "{}.{}: {} list items name a list in another repo; dropped, as marco never keeps them",
                 ctx.plan.keyspace, tb.name, st.cross_repo_rows[t]
+            );
+        }
+        if tb.record.is_some() {
+            eprintln!(
+                "{}.{}: {} records {} doesn't keep (when), {} that don't parse or aren't an edge; dropped",
+                ctx.plan.keyspace, tb.name, st.unmatched_rows[t], tb.relation, st.bad_rows[t]
             );
         }
     }
@@ -901,9 +1010,9 @@ mod tests {
         assert_eq!(buf.push(Some(a), Some("3kaaaaaaaaa24"), Some(b), Some(None)), 0);
         assert_eq!(buf.push(Some(a), Some("3kaaaaaaaaa25"), None, None), 0);
         // counted with their partition, so a resume that rereads it doesn't count them twice
-        assert_eq!((buf.nulls, buf.cross_repo), (0, 0));
+        assert_eq!(buf.skipped, Skipped::default());
         buf.seal(1 << 20);
-        assert_eq!((buf.rows, buf.nulls, buf.cross_repo), (1, 2, 1));
+        assert_eq!((buf.rows, buf.skipped.nulls, buf.skipped.cross_repo), (1, 2, 1));
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("p-aa.rb.zst");
         std::fs::write(&f, zstd::bulk::compress(&buf.buckets[bucket_of(a)], 1).unwrap()).unwrap();
@@ -917,25 +1026,32 @@ mod tests {
 
     #[test]
     fn a_list_table_selects_its_list_column() {
-        let t = |list: Option<&str>| super::super::config::Table {
+        let t = |list: Option<&str>, subject: &str, record: Option<&str>| super::super::config::Table {
             relation: "listitem".into(),
             name: "list_items".into(),
             actor: "actor_did".into(),
             rkey: "rkey".into(),
-            subject: "subject".into(),
+            subject: subject.into(),
             list: list.map(String::from),
+            record: record.map(String::from),
         };
         let plan = Plan {
             keyspace: "bsky".into(),
             datacenter: None,
-            tables: vec![t(Some("list")), t(None)],
+            tables: vec![
+                t(Some("list"), "subject", None),
+                t(None, "subject", None),
+                t(None, "list", None),
+                t(None, "target_did", Some("raw")),
+            ],
             modes: vec![],
             keys: vec![],
-            partition_keys: vec![vec!["actor_did".into()]; 2],
-            clustering_keys: vec![vec!["rkey".into()]; 2],
+            partition_keys: vec![vec!["actor_did".into()]; 4],
+            clustering_keys: vec![vec!["rkey".into()]; 4],
             shards: 0,
             nodes: 0,
             ranges: vec![],
+            record_rules: vec![],
         };
         assert_eq!(
             select(&plan, 0, true),
@@ -943,5 +1059,83 @@ mod tests {
              WHERE token(actor_did) > ? AND token(actor_did) <= ? BYPASS CACHE"
         );
         assert!(!select(&plan, 1, false).contains("list,") && !select(&plan, 1, false).contains(", list "));
+        // a list subscription's table: the list column is its subject
+        assert!(select(&plan, 2, false).starts_with("SELECT token(actor_did), actor_did, rkey, list FROM"));
+        // a record table reads the record in place of the subject
+        assert!(select(&plan, 3, false).starts_with("SELECT token(actor_did), actor_did, rkey, raw FROM"));
+    }
+
+    /// The relations of the list subjects: a list's purpose (its own URI,
+    /// while it's a mod list) and a list item read from its record.
+    fn record_rels() -> (Relation, Relation) {
+        let r = marco_core::Relations::parse_toml(
+            r#"
+[[relation]]
+name = "listitem"
+collection = "app.bsky.graph.listitem"
+subject = "subject"
+list = "list"
+
+[[relation]]
+name = "modlist"
+collection = "app.bsky.graph.list"
+subject = "$self"
+when = { purpose = "app.bsky.graph.defs#modlist" }
+"#,
+        )
+        .unwrap();
+        (r.get(r.by_name("modlist").unwrap()).clone(), r.get(r.by_name("listitem").unwrap()).clone())
+    }
+
+    /// A record table's rows go through the relation's rule: a mod list is
+    /// an edge to its own URI, a list of another purpose is unmatched, and a
+    /// record that doesn't parse, or isn't an edge, is bad. Each is counted
+    /// with its partition.
+    #[test]
+    fn a_record_table_keeps_the_edges_its_relation_keeps() {
+        let (modlist, listitem) = record_rels();
+        let (a, b) = ("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb");
+        let rec = |purpose: &str| {
+            format!(
+                r#"{{"$type":"app.bsky.graph.list","name":"x","purpose":"{purpose}","createdAt":"2024-01-01T00:00:00Z"}}"#
+            )
+        };
+        let mut buf = Buf::new();
+        let k = "3kaaaaaaaaa22";
+        assert!(buf.push_record(&modlist, Some(a), Some(k), Some(rec("app.bsky.graph.defs#modlist").as_bytes())) > 0);
+        for p in ["app.bsky.graph.defs#curatelist", "app.bsky.graph.defs#referencelist"] {
+            assert_eq!(buf.push_record(&modlist, Some(a), Some("3kaaaaaaaaa23"), Some(rec(p).as_bytes())), 0);
+        }
+        assert_eq!(buf.push_record(&modlist, Some(a), Some("3kaaaaaaaaa24"), Some(br#"{"name":"no purpose"}"#)), 0);
+        assert_eq!(buf.push_record(&modlist, Some(a), Some("3kaaaaaaaaa25"), Some(b"{not json")), 0);
+        assert_eq!(buf.push_record(&modlist, Some(a), Some("3kaaaaaaaaa26"), Some(b"\"a string\"")), 0);
+        // an rkey no URI can hold: not an edge
+        let bad_rkey = rec("app.bsky.graph.defs#modlist");
+        assert_eq!(buf.push_record(&modlist, Some(a), Some("a/b"), Some(bad_rkey.as_bytes())), 0);
+        assert_eq!(buf.push_record(&modlist, Some(a), None, Some(b"{}")), 0);
+        assert_eq!(buf.push_record(&modlist, Some(a), Some(k), None), 0);
+        // a list item's record: its own list kept, another repo's dropped as cross-repo
+        let item = |list: &str| format!(r#"{{"subject":"{b}","list":"{list}"}}"#);
+        let own = format!("at://{a}/app.bsky.graph.list/l1");
+        assert!(buf.push_record(&listitem, Some(a), Some(k), Some(item(&own).as_bytes())) > 0);
+        let theirs = format!("at://{b}/app.bsky.graph.list/l1");
+        assert_eq!(buf.push_record(&listitem, Some(a), Some(k), Some(item(&theirs).as_bytes())), 0);
+        assert_eq!(buf.skipped, Skipped::default());
+        buf.seal(1 << 20);
+        assert_eq!(buf.rows, 2);
+        assert_eq!(buf.skipped, Skipped { nulls: 2, cross_repo: 1, unmatched: 3, bad: 3 });
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("p-aa.rb.zst");
+        std::fs::write(&f, zstd::bulk::compress(&buf.buckets[bucket_of(a)], 1).unwrap()).unwrap();
+        let mut rows = Rows::open(&f).unwrap();
+        // the mod list's row: its own URI as the subject, as the build takes a $self row
+        let mut cols = vec![Vec::new(); 3];
+        assert!(rows.next(&mut cols).unwrap());
+        assert_eq!(cols[2], format!("at://{a}/app.bsky.graph.list/{k}").as_bytes());
+        assert_eq!((rows.i64().unwrap(), rows.u8().unwrap()), (0, 1));
+        // the list item's: its subject and list
+        let mut cols = vec![Vec::new(); 4];
+        assert!(rows.next(&mut cols).unwrap());
+        assert_eq!((cols[2].as_slice(), cols[3].as_slice()), (b.as_bytes(), own.as_bytes()));
     }
 }

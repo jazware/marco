@@ -190,11 +190,12 @@ A record whose `when` paths don't all hold isn't an edge, and its key empties li
 Quote a dotted path in `when` (`when = { "a.b" = "x" }`), or TOML reads it as a nested table and
 the config is refused.
 
-Only a path that reads the record can check `when`: Jetstream, the firehose, `scan-jetstream` and
-`scan-hubble`. Build input holds no records, so `marco-load build` keeps every create or update row
-as an edge, and the write API keeps every add. So an exporter writes a row only for a record whose
-`when` paths hold, and a delete row for one updated so they don't. `scan-scylla` reads columns, so
-it refuses a relation with `when` or `$self` ([Rebuilding from Scylla](scylla.md)).
+Only a path that reads the record can check `when`: Jetstream, the firehose, `scan-jetstream`,
+`scan-hubble`, and `scan-scylla` on a table that holds the record
+([Tables that hold the record](scylla.md#tables-that-hold-the-record)). Build input holds no
+records, so `marco-load build` keeps every create or update row as an edge, and the write API keeps
+every add. So an exporter writes a row only for a record whose `when` paths hold, and a delete row
+for one updated so they don't.
 
 Reads that compare two actors reach these relations through relationships by list
 ([Relationships](#relationships)): `block_by_list` is `listblock`, `listitem` and `modlist`
