@@ -111,16 +111,21 @@ one that holds about a third of it. At today's write rate that's about once a da
 
 ## Restart
 
-| Step | Whole network, measured |
-|---|---|
-| Open: read and check the footers, page sums and pinned sections, then load every page when `--memory` holds them | 7.8 s from a cold disk |
-| Replay the segments after the manifest's cut | 4.46M ops in 10.3 s (432k ops/s) |
-| Each source resumes from the newest segment's cursor | caught up in under a second |
-| Ready | every expected source under 1 s behind |
+| Step | Whole network, `--memory` holds the snapshot | `--memory` holds about a quarter of it |
+|---|---|---|
+| Open: read and check the footers, page sums and pinned sections, then load every page when `--memory` holds them | 7.8 s from a cold disk | 8-11 s (pinned sections only; the rest is read on demand) |
+| Replay the segments after the manifest's cut | 4.46M ops in 10.3 s (432k ops/s) | 2.19M ops in ~50 s (~36k ops/s) |
+| Each source resumes from the newest segment's cursor | caught up in under a second | not measured apart |
+| Ready | every expected source under 1 s behind | |
 
 Replay is most of a restart with more than a day of segments (4.46M ops, where a day of follows
-and blocks is ~2.4-2.7M). Checkpoints keep the segments short. Every page open reads is checked
-against its sum, and so is every page read after it.
+and blocks is ~2.4-2.7M). With the snapshot resident, replay runs from memory. When `--memory`
+holds only part of it (12 GiB for a 44 GB snapshot in the second column), open loads only what's
+pinned and the cache starts cold, so each replayed op that touches a list not yet read waits on
+a disk read: replay ran 12 times slower, and 22 h of segments made a 62 s open. Checkpoints keep
+the segments short, and a checkpoint just before a planned restart (`POST /admin/checkpoint`,
+[Checkpoint export](operations.md#checkpoint-export)) leaves only the minutes since to replay.
+Every page open reads is checked against its sum, and so is every page read after it.
 
 ## The ready gate
 

@@ -28,8 +28,9 @@ pub struct AuthConfig {
     pub proxy_protocol_from: Vec<Cidr>,
     /// When set, the header login is believed only from these callers.
     pub proxy_peers: Vec<String>,
-    /// A token that opens the checkpoint export and nothing else (seek's builder mirroring it):
-    /// anywhere else on the admin listener it's refused.
+    /// A token that opens the checkpoint export and nothing else (seek's builder mirroring it, a
+    /// deploy starting a checkpoint before its restart): anywhere else on the admin listener it's
+    /// refused.
     pub export_token: Option<String>,
 }
 

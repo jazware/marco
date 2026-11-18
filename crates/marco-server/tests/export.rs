@@ -207,6 +207,44 @@ async fn the_export_token_and_the_limits() {
     );
 }
 
+/// What a deploy runs before its restart: the export token starts a checkpoint, and peek shows the
+/// job's end, the new number and the segments emptied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_export_token_starts_a_checkpoint() {
+    let (addr, app, _dir) = start().await;
+    let c = reqwest::Client::new();
+    let url = format!("http://{addr}/admin/checkpoint");
+    assert_eq!(c.post(&url).send().await.unwrap().status(), 401);
+    writes(&app, 1).await;
+    let peek = |c: reqwest::Client, url: String| async move {
+        c.get(format!("{url}?peek=1"))
+            .bearer_auth(EXPORT)
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+    };
+    let p0 = peek(c.clone(), url.clone()).await;
+    assert!(p0["segment_ops"].as_u64().unwrap() > 0, "{p0}");
+    let r = c.post(&url).bearer_auth(EXPORT).send().await.unwrap();
+    assert_eq!(r.status(), 202);
+    let s: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(s["checkpoint"], p0["checkpoint"]);
+    assert_eq!(s["job"]["kind"], "checkpoint");
+    let p = loop {
+        let p = peek(c.clone(), url.clone()).await;
+        if p["job"]["running"] == false {
+            break p;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert_eq!(p["job"]["error"], "", "{p}");
+    assert!(p["checkpoint"].as_u64().unwrap() > p0["checkpoint"].as_u64().unwrap(), "{p}");
+    assert_eq!(p["segment_ops"], 0, "{p}");
+}
+
 /// A lease answers from file sizes: with background I/O paced to 1 kB/s a single read of one file
 /// would take longer than the test, and no file bytes are served for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

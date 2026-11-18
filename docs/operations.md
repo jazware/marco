@@ -98,7 +98,7 @@ console's Settings page shows each one's value and where it came from.
 | `--admin-operators` | `MARCO_ADMIN_OPERATORS` | | The logins the header may name, comma-separated. |
 | `--proxy-protocol-from` | `MARCO_PROXY_PROTOCOL_FROM` | | Addresses (CIDRs) whose connections start with a PROXY v2 header naming the caller. |
 | `--admin-proxy-peers` | `MARCO_ADMIN_PROXY_PEERS` | | The callers (TLV `0xE0`) whose header login is believed, comma-separated. |
-| `--export-token-file` | `MARCO_EXPORT_TOKEN_FILE` | | A token (16 characters at least, not the admin token) good for the checkpoint export alone: `/admin/checkpoint` and its files. Anywhere else on the admin listener it's a 403. |
+| `--export-token-file` | `MARCO_EXPORT_TOKEN_FILE` | | A token (16 characters at least, not the admin token) good for the checkpoint export alone: `/admin/checkpoint`, its files, and starting a checkpoint. Anywhere else on the admin listener it's a 403. |
 | `--jetstream URL` | `MARCO_JETSTREAM` | | Follow a Jetstream instance. |
 | `--jetstream-v2 URL` | `MARCO_JETSTREAM_V2` | | Follow a Jetstream v2 instance (`subscribeEvents`) by seq. Conflicts with `--jetstream` and `--firehose`. |
 | `--firehose URL` | `MARCO_FIREHOSE` | | Follow a relay's `subscribeRepos`. Conflicts with `--jetstream` and `--jetstream-v2`. |
@@ -270,13 +270,14 @@ relations first. A snapshot without them is format 6, and builds on either side 
 Another process can copy the current checkpoint while marco keeps serving, checkpointing and
 compacting: seek's builder mirrors it to run PageRank, and it seeds a replica or takes a backup the
 same way. All of it is on the admin listener, behind the admin token, a proxy login, or the
-export token (`--export-token-file`), which opens the export and nothing else. At most 4 leases
+export token (`--export-token-file`), which opens these calls and nothing else. At most 4 leases
 and 8 file streams run at once; past that a call gets 429.
 
 | Call | What it does |
 |---|---|
 | `GET /admin/checkpoint?ttl=SECS` | A lease (default 1800 s, at most 6 h): the manifest, its checkpoint number, and every file it names with its name and size (no file is read: it answers at once) |
-| `GET /admin/checkpoint?peek=1` | The checkpoint number, build and time only, no lease |
+| `GET /admin/checkpoint?peek=1` | The checkpoint number, build and time, `segment_ops` (ops in the segments since it) and `job` (the running or last job: `kind`, `running`, `done`/`total` shards, `error`), no lease |
+| `POST /admin/checkpoint` | Starts a checkpoint, as the console's Checkpoint now does, and answers at once: 202 with `job` and the current `checkpoint`, 409 while a job (a checkpoint or a verify) holds the slot, 412 on `--read-only`. Poll peek until `job.running` is false, `job.error` is empty and `checkpoint` has moved. Before a planned restart this leaves only the minutes since to replay ([Restart](durability.md#restart)) |
 | `GET /admin/checkpoint/files/NAME?lease=ID` | One file, with `Range: bytes=A-` to resume |
 | `DELETE /admin/checkpoint?lease=ID` | Ends the lease |
 

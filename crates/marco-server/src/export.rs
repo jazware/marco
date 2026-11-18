@@ -4,7 +4,8 @@
 //!
 //! ```text
 //! GET    /admin/checkpoint?ttl=SECS        a lease: the manifest, every file it names (name, bytes)
-//! GET    /admin/checkpoint?peek=1          the checkpoint number only, no lease
+//! GET    /admin/checkpoint?peek=1          the checkpoint number and the job, no lease
+//! POST   /admin/checkpoint                 a checkpoint now (a deploy's, so its restart replays little)
 //! GET    /admin/checkpoint/files/NAME?lease=ID   one file, Range for a resume
 //! DELETE /admin/checkpoint?lease=ID        the lease's end
 //! ```
@@ -212,16 +213,43 @@ fn err(code: StatusCode, m: impl std::fmt::Display) -> Response {
     (code, format!("{m}\n")).into_response()
 }
 
-async fn checkpoint(State((_, ex)): State<St>, Query(q): Query<Q>) -> Response {
+fn manifest(ex: &Export) -> anyhow::Result<Manifest> {
+    Ok(serde_json::from_slice(&std::fs::read(ex.snapshot.join(MANIFEST))?)?)
+}
+
+fn job(j: &crate::app::JobState) -> serde_json::Value {
+    serde_json::json!({
+        "kind": j.kind, "running": j.running, "started_ms": j.started_ms, "finished_ms": j.finished_ms,
+        "error": j.error, "done": j.done, "total": j.total,
+    })
+}
+
+/// 409 while a job holds the slot (a verify, or a checkpoint, which leaves the caller nothing to
+/// do but wait for it); peek shows the job's end.
+async fn start(State((app, ex)): State<St>) -> Response {
+    let before = match manifest(&ex) {
+        Ok(m) => m.checkpoint,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let (code, j, error) = match app.start_checkpoint() {
+        Ok(j) => (StatusCode::ACCEPTED, j, String::new()),
+        Err(e) => {
+            let j = app.job();
+            (if j.running { StatusCode::CONFLICT } else { StatusCode::PRECONDITION_FAILED }, j, e)
+        }
+    };
+    let body = serde_json::json!({"checkpoint": before, "job": job(&j), "error": error});
+    (code, axum::Json(body)).into_response()
+}
+
+async fn checkpoint(State((app, ex)): State<St>, Query(q): Query<Q>) -> Response {
     ex.sweep();
     if q.peek.is_some() {
-        return match std::fs::read(ex.snapshot.join(MANIFEST))
-            .map_err(anyhow::Error::from)
-            .and_then(|b| Ok(serde_json::from_slice::<Manifest>(&b)?))
-        {
-            Ok(m) => axum::Json(
-                serde_json::json!({"checkpoint": m.checkpoint, "build": m.build, "written_ms": m.written_ms}),
-            )
+        return match manifest(&ex) {
+            Ok(m) => axum::Json(serde_json::json!({
+                "checkpoint": m.checkpoint, "build": m.build, "written_ms": m.written_ms,
+                "segment_ops": app.durability.lock().unwrap().segment_ops, "job": job(&app.job()),
+            }))
             .into_response(),
             Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
         };
@@ -382,7 +410,7 @@ pub fn routes(app: &Arc<App>, ex: Arc<Export>) -> axum::Router {
         }
     });
     axum::Router::new()
-        .route("/admin/checkpoint", axum::routing::get(checkpoint).delete(release))
+        .route("/admin/checkpoint", axum::routing::get(checkpoint).post(start).delete(release))
         .route("/admin/checkpoint/files/{name}", axum::routing::get(file))
         .with_state((app.clone(), ex))
 }
