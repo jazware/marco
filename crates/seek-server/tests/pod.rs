@@ -2,7 +2,7 @@
 //! graph) and a builder-made artifact, over Connect and gRPC: logged out by
 //! rank, logged in with follows first, blocks dropped both ways (spaced
 //! queries' matches too), an exact handle kept through a block, the overlay's
-//! changes, and a swap.
+//! changes, a swap, and the drain on the way out.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -154,7 +154,7 @@ async fn pod_with(
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
     let r = seek_server::serve::api_router(&pod);
-    tokio::spawn(async move { axum::serve(nodelay(l), r).await });
+    pod.drain.spawn(axum::serve(nodelay(l), r).with_graceful_shutdown(pod.drain.stopped()));
     Pods { addr, pod, art, js }
 }
 
@@ -284,6 +284,23 @@ async fn pod_against_marco() {
     ] {
         assert!(text.contains(m), "{m} missing");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_answers_then_refuses() {
+    let (maddr, _mdir) = marco().await;
+    let dir = tempfile::tempdir().unwrap();
+    let p = pod(Some(maddr), dir.path(), Duration::from_secs(5)).await;
+    ready(&p).await;
+    p.pod.drain.lame_duck();
+    let r = reqwest::get(format!("http://{}/readyz", p.addr)).await.unwrap();
+    assert_eq!(r.status(), 503);
+    assert_eq!(r.text().await.unwrap(), "shutting down\n");
+    // not ready, but queries are still answered, logged in too
+    assert_eq!(ask(p.addr, Protocol::Grpc, "jo", V).await, vec![did(A), did(E), did(B)]);
+    assert!(p.pod.drain.stop(Duration::from_secs(5)).await);
+    let e = std::net::TcpStream::connect(p.addr).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::ConnectionRefused);
 }
 
 async fn send(p: &Pods, dir: &std::path::Path, cursor: u64) -> String {

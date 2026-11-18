@@ -801,8 +801,9 @@ pub async fn build_once(cfg: Config, mut st: State) -> Result<()> {
     Ok(())
 }
 
-/// The builder's HTTP routes: the newest artifact, /healthz, /readyz.
-pub fn router(published: Arc<Mutex<Published>>) -> axum::Router {
+/// The builder's HTTP routes: the newest artifact, /healthz, /readyz. `/readyz` is 503 once `drain`
+/// begins, and an HTTP/1 response says `Connection: close` from then on.
+pub fn router(published: Arc<Mutex<Published>>, drain: &marco_ops::drain::Drain) -> axum::Router {
     use axum::extract::State as S;
     use axum::response::IntoResponse;
     async fn latest(S(p): S<Arc<Mutex<Published>>>, headers: http::HeaderMap) -> axum::response::Response {
@@ -830,7 +831,10 @@ pub fn router(published: Arc<Mutex<Published>>) -> axum::Router {
         )
             .into_response()
     }
-    async fn ready(S(p): S<Arc<Mutex<Published>>>) -> (http::StatusCode, String) {
+    async fn ready(S((p, d)): S<(Arc<Mutex<Published>>, marco_ops::drain::Drain)>) -> (http::StatusCode, String) {
+        if d.draining() {
+            return (http::StatusCode::SERVICE_UNAVAILABLE, "shutting down\n".into());
+        }
         let p = p.lock().unwrap();
         match (&p.latest, &p.last_error) {
             (Some(_), None) => (http::StatusCode::OK, "ready\n".into()),
@@ -839,10 +843,10 @@ pub fn router(published: Arc<Mutex<Published>>) -> axum::Router {
         }
     }
     axum::Router::new()
-        .route("/artifact/latest", axum::routing::get(latest))
-        .route("/readyz", axum::routing::get(ready))
+        .route("/artifact/latest", axum::routing::get(latest).with_state(published.clone()))
+        .route("/readyz", axum::routing::get(ready).with_state((published, drain.clone())))
         .route("/healthz", axum::routing::get(|| async { "ok\n" }))
-        .with_state(published)
+        .layer(axum::middleware::from_fn_with_state(drain.clone(), marco_ops::drain::close_http1))
 }
 
 fn tokio_util_stream(mut f: tokio::fs::File) -> impl futures::Stream<Item = std::io::Result<bytes::Bytes>> {

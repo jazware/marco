@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use marco_ops::drain::Drain;
 use tokio::sync::mpsc;
 
 marco_ops::jemalloc!();
@@ -45,6 +46,25 @@ struct Common {
     /// Log format: json or text.
     #[arg(long, env = "SEEK_LOG_FORMAT", default_value = "json")]
     log_format: String,
+    /// On SIGTERM or Ctrl-C, /readyz answers 503 and every listener keeps serving this many
+    /// seconds, so a load balancer takes the process out first (0: stop at once; a second signal
+    /// cuts it short).
+    #[arg(long, env = "SEEK_SHUTDOWN_DRAIN_SECS", default_value_t = 10.0)]
+    shutdown_drain_secs: f64,
+    /// Then the listeners stop accepting, HTTP/2 connections get a GOAWAY, and the requests in flight
+    /// have this many seconds to finish.
+    #[arg(long, env = "SEEK_SHUTDOWN_GRACE_SECS", default_value_t = 10.0)]
+    shutdown_grace_secs: f64,
+}
+
+impl Common {
+    /// (drain, grace).
+    fn shutdown(&self) -> Result<(Duration, Duration)> {
+        Ok((
+            marco_ops::drain::secs("--shutdown-drain-secs", self.shutdown_drain_secs)?,
+            marco_ops::drain::secs("--shutdown-grace-secs", self.shutdown_grace_secs)?,
+        ))
+    }
 }
 
 #[derive(clap::Args)]
@@ -283,16 +303,28 @@ fn otel_layer(endpoint: &str, service: &str) -> Result<(OtelLayer, opentelemetry
     Ok((tracing_opentelemetry::layer().with_tracer(tracer), provider))
 }
 
-fn ops(addr: &str, refresh: marco_ops::Refresh) -> Result<SocketAddr> {
+fn ops(addr: &str, refresh: marco_ops::Refresh, drain: &Drain) -> Result<SocketAddr> {
     let l = std::net::TcpListener::bind(addr).with_context(|| format!("bind --ops-listen {addr}"))?;
     l.set_nonblocking(true)?;
     let local = l.local_addr()?;
-    let r = marco_ops::router(Some(refresh));
-    tokio::spawn(async move {
-        let l = tokio::net::TcpListener::from_std(l).expect("ops listener");
-        let _ = axum::serve(l, r).await;
-    });
+    let l = tokio::net::TcpListener::from_std(l)?;
+    let r = marco_ops::router(Some(refresh))
+        .layer(axum::middleware::from_fn_with_state(drain.clone(), marco_ops::drain::close_http1));
+    drain.spawn(axum::serve(l, r).with_graceful_shutdown(drain.stopped()));
     Ok(local)
+}
+
+/// Once SIGTERM or Ctrl-C has come: `/readyz` 503 for the drain, then the listeners stop and the
+/// requests in flight get the grace.
+async fn stop(drain: &Drain, (d, grace): (Duration, Duration)) {
+    tracing::info!(
+        drain_secs = d.as_secs_f64(),
+        grace_secs = grace.as_secs_f64(),
+        "stopping: /readyz is 503 and the listeners serve until the drain ends (another signal cuts it short)"
+    );
+    if !drain.run(d, grace).await {
+        tracing::warn!("requests still in flight past --shutdown-grace-secs: stopping anyway");
+    }
 }
 
 fn verifier(i: &Ingest) -> (Option<verify::Queue>, mpsc::Receiver<(String, verify::Outcome)>) {
@@ -318,7 +350,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     vlatproto::http::set_user_agent(concat!("seek/", env!("CARGO_PKG_VERSION")));
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    rt.block_on(run(cli))
+    let r = rt.block_on(run(cli));
+    // A builder's build or state save may still hold a thread. Neither waits: each file lands
+    // whole by rename or not at all.
+    rt.shutdown_timeout(Duration::from_secs(1));
+    r
 }
 
 async fn run(cli: Cli) -> Result<()> {
@@ -345,6 +381,7 @@ async fn run(cli: Cli) -> Result<()> {
             common,
         } => {
             let _p = init_logs(&common, "seek")?;
+            let shutdown = common.shutdown()?;
             metrics::init();
             std::fs::create_dir_all(&data).with_context(|| format!("create {}", data.display()))?;
             let local = std::path::Path::new(source.strip_prefix("file://").unwrap_or(&source));
@@ -380,11 +417,11 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let pod = serve::Pod::new(cfg, marco);
             let p = pod.clone();
-            let oa = ops(&common.ops_listen, Arc::new(move || p.refresh_gauges()))?;
+            let oa = ops(&common.ops_listen, Arc::new(move || p.refresh_gauges()), &pod.drain)?;
             let l = tokio::net::TcpListener::bind(&listen).await.with_context(|| format!("bind --listen {listen}"))?;
             let la = l.local_addr()?;
             let r = serve::api_router(&pod);
-            tokio::spawn(async move { axum::serve(nodelay(l), r).await });
+            pod.drain.spawn(axum::serve(nodelay(l), r).with_graceful_shutdown(pod.drain.stopped()));
             tracing::info!(listen = %la, ops = %oa, "seek serving");
 
             let src =
@@ -421,7 +458,7 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             });
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
+                _ = marco_ops::drain::signal() => stop(&pod.drain, shutdown).await,
                 _ = ingest_task => {}
             }
             Ok(())
@@ -452,6 +489,7 @@ async fn run(cli: Cli) -> Result<()> {
             common,
         } => {
             let _p = init_logs(&common, "seek-builder")?;
+            let shutdown = common.shutdown()?;
             metrics::init();
             std::fs::create_dir_all(&dir)?;
             let sp = dir.join("state.seekstate");
@@ -505,10 +543,11 @@ async fn run(cli: Cli) -> Result<()> {
                 return builder::build_once(cfg, st).await;
             }
             let published = Arc::new(Mutex::new(builder::Published::default()));
-            let oa = ops(&common.ops_listen, Arc::new(|| {}))?;
+            let drain = Drain::new();
+            let oa = ops(&common.ops_listen, Arc::new(|| {}), &drain)?;
             let l = tokio::net::TcpListener::bind(&listen).await.with_context(|| format!("bind --listen {listen}"))?;
-            let r = builder::router(published.clone());
-            tokio::spawn(async move { axum::serve(nodelay(l), r).await });
+            let r = builder::router(published.clone(), &drain);
+            drain.spawn(axum::serve(nodelay(l), r).with_graceful_shutdown(drain.stopped()));
             tracing::info!(listen = %listen, ops = %oa, "seek builder");
             let (js_tx, js_rx) = mpsc::channel(500_000);
             let js = ingest.jetstream.clone();
@@ -517,7 +556,15 @@ async fn run(cli: Cli) -> Result<()> {
             let (tx, vrx) = mpsc::channel(10_000);
             let v = Arc::new(verify::Verifier::new(&ingest.plc, ingest.plc_rate, ingest.verify_rate, ingest.insecure));
             let queue = verify::Queue::start(v, ingest.verify_workers, tx);
-            builder::run(cfg, st, js_rx, vrx, queue, published).await
+            // its own task: a build blocks its thread, and the signal mustn't wait for it
+            let cycles = tokio::spawn(builder::run(cfg, st, js_rx, vrx, queue, published));
+            tokio::select! {
+                r = cycles => r.context("the builder's cycle loop panicked")?,
+                _ = marco_ops::drain::signal() => {
+                    stop(&drain, shutdown).await;
+                    Ok(())
+                }
+            }
         }
         Cmd::Eval(a) => {
             println!("{}", serde_json::to_string_pretty(&eval::run(a).await?)?);

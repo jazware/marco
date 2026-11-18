@@ -149,8 +149,11 @@ Every flag has an env var. `seek serve`:
 | `--s3-endpoint`, `--s3-region`, `--s3-credentials` | `SEEK_S3_*` | | For an `s3://` source: a JSON file `{"access_key_id", "secret_access_key"}` |
 | `--trace-ratio`, `--otlp` | `SEEK_TRACE_RATIO`, `SEEK_OTLP` | 0 | The share of queries traced, and the collector |
 | `--log-format` | `SEEK_LOG_FORMAT` | `json` | `json` or `text`; `SEEK_LOG` filters (`info`) |
+| `--shutdown-drain-secs` | `SEEK_SHUTDOWN_DRAIN_SECS` | 10 | On SIGTERM or Ctrl-C, how long `/readyz` answers 503 while the listeners keep serving ([Stopping](#stopping)). 0 stops at once |
+| `--shutdown-grace-secs` | `SEEK_SHUTDOWN_GRACE_SECS` | 10 | Then, once the listeners stop accepting, how long the requests in flight have to finish |
 
-`seek builder` also takes `--jetstream`, the verification flags, the S3 flags and the ops flags, and:
+`seek builder` also takes `--jetstream`, the verification flags, the S3 flags, the ops flags and the
+shutdown flags, and:
 
 | Flag | Env | Default | |
 |---|---|---|---|
@@ -175,7 +178,18 @@ Every flag has an env var. `seek serve`:
 the reason: no artifact yet; refusing to serve (the artifact's cursor is older than the replay
 window, or Jetstream's replay skipped events); replaying Jetstream from the artifact's cursor; or
 Jetstream more than `--max-lag-seconds` behind or silent. The builder's `/readyz` is 200 once it has
-published and its last cycle succeeded.
+published and its last cycle succeeded. Both answer 503 `shutting down` from SIGTERM on.
+
+## Stopping
+
+A pod and the builder stop as marco does ([Stopping](operations.md#stopping)). On SIGTERM or
+Ctrl-C, `/readyz` turns 503 while every listener keeps serving, queries included, for
+`--shutdown-drain-secs` (10 s), and each HTTP/1 answer says `Connection: close`. Then the listeners
+stop accepting, HTTP/2 connections (the AppView's) get a GOAWAY, and queries in flight get up to
+`--shutdown-grace-secs` (10 s). The process exits without waiting for a build or a state save in
+progress: each lands whole by rename or not at all, and the builder starts again from its last saved
+state. A pod whose artifact download the builder's stop cut short tries again at its next poll.
+Kubernetes' default `terminationGracePeriodSeconds` of 30 s covers the defaults.
 
 ## Metrics
 

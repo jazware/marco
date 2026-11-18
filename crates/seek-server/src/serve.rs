@@ -318,6 +318,9 @@ pub struct Pod {
     /// When each DID's entry was last dropped by a follow event (unix ms), for `marco_lag` and the
     /// longest build after it.
     dropped: parking_lot::Mutex<rustc_hash::FxHashMap<String, u64>>,
+    /// The listeners' clean stop (`--shutdown-drain-secs`): not ready once it begins, while
+    /// queries are still answered.
+    pub drain: marco_ops::drain::Drain,
 }
 
 impl Pod {
@@ -354,6 +357,7 @@ impl Pod {
             marco_down_until: AtomicU64::new(0),
             rekey: ArcSwapOption::empty(),
             dropped: Default::default(),
+            drain: marco_ops::drain::Drain::new(),
         })
     }
 
@@ -361,8 +365,11 @@ impl Pod {
         self.cur.load_full()
     }
 
-    /// (ready, why not).
+    /// (ready, why not): `/readyz`. Not ready for good once the drain begins.
     pub fn readiness(&self) -> (bool, String) {
+        if self.drain.draining() {
+            return (false, "shutting down".into());
+        }
         (self.ready.load(Ordering::Relaxed), self.why.lock().unwrap().clone())
     }
 
@@ -1129,7 +1136,8 @@ pub fn nodelay(l: tokio::net::TcpListener) -> impl axum::serve::Listener<Addr = 
     })
 }
 
-/// The API listener's routes: the service, /healthz and /readyz.
+/// The API listener's routes: the service, /healthz and /readyz. While the pod drains, an HTTP/1
+/// response says `Connection: close` ([`marco_ops::drain::close_http1`]).
 pub fn api_router(pod: &Arc<Pod>) -> axum::Router {
     use seek_api::connect::bsky::ServiceExt;
     let svc = Arc::new(Api(pod.clone())).register(connectrpc::Router::new()).into_axum_service();
@@ -1149,4 +1157,5 @@ pub fn api_router(pod: &Arc<Pod>) -> axum::Router {
                 }
             }),
         )
+        .layer(axum::middleware::from_fn_with_state(pod.drain.clone(), marco_ops::drain::close_http1))
 }
