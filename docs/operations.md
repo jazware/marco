@@ -254,9 +254,9 @@ A lease hard-links the files its manifest names into `<snapshot>.export/<lease>/
 filesystem has to allow hard links (it's the same one). A compaction or a newer checkpoint can delete
 the originals meanwhile and the copy still reads the leased checkpoint. The links go when the lease is
 deleted or its ttl passes, and a restart clears them all. File streams go through `--background-io`,
-so requests go first. The lease carries no checksums: a file never changes under its name (the
-checkpoint number is in it), and every section of a snapshot file has its own xxh3, which the reader
-checks. Copied files plus the manifest are a snapshot
+so requests go first. The lease carries no checksums: within a build a file never changes under its
+name (the checkpoint number is in it), and every section of a snapshot file has its own xxh3, which
+the reader checks. Copied files plus the manifest are a snapshot
 directory `marco serve` or `marco-load` can open.
 
 `marco-load mirror --url ADMIN --token-file FILE --dir DIR` keeps a local copy in sync. It takes a
@@ -264,6 +264,11 @@ lease, downloads only the files it doesn't have by name and size (a partial one 
 checks each fetched file against its own section checksums at local disk speed, unpaced (a file that
 fails is deleted and the sync fails, so the next run fetches it again), links them into `DIR/snap-<checkpoint>` and points `DIR/current` at it, then drops files no snapshot
 names. The first sync copies the whole snapshot, and later ones copy what the checkpoints since wrote.
+Names repeat across builds, though: every build's directory file is `directory.marco`, and a fresh
+build's shard files are `shard-000-00000000.marco` and on. So a local file is kept only if its footer
+names the checkpoint's build (and a shard file, the shard the manifest lists it under), and after the
+peer rebuilds, the mirror fetches those files again rather than linking the old build's beside the
+new one's.
 
 ## Profiling and tracing
 

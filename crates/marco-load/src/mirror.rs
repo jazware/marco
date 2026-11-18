@@ -1,8 +1,9 @@
 //! `marco-load mirror`: keeps a local copy of a running marco's current
 //! checkpoint, through its admin listener's checkpoint export. It takes a
 //! lease, downloads only the files it doesn't have by name and size (a
-//! partial one resumed with Range), checks each fetched file against its
-//! own section checksums at local disk speed, then links them into a snapshot
+//! partial one resumed with Range; a local one whose footer names another
+//! build is fetched again), checks each fetched file against its own
+//! section checksums at local disk speed, then links them into a snapshot
 //! directory, `DIR/snap-<checkpoint>`, and points `DIR/current` at it. Files
 //! no snapshot names any more go. PageRank and seek's builder read
 //! `DIR/current` with `--snapshot`.
@@ -10,13 +11,14 @@
 //! The first run copies the whole snapshot; later ones only what the
 //! checkpoints since wrote (their patches and new bases).
 
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use marco_core::snapshot::{PagedFooter, TRAILER};
-use marco_core::store::DIR_FILE;
+use marco_core::store::{ShardFiles, DIR_FILE};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -106,7 +108,7 @@ async fn sync(a: &Args) -> Result<Value> {
     }
     let files_dir = a.dir.join("files");
     std::fs::create_dir_all(&files_dir)?;
-    let r = match drop_stale_dir(&files_dir, &lr) {
+    let r = match drop_stale(&files_dir, &lr) {
         Ok(()) => fetch(&c, &auth, &base, &lr, &files_dir).await,
         Err(e) => Err(e),
     };
@@ -162,29 +164,44 @@ fn read_footer(p: &Path) -> Result<PagedFooter> {
     PagedFooter::parse(&json, r.start)
 }
 
-/// The build a directory file names, if it reads as one.
-fn dir_build(p: &Path) -> Option<u64> {
-    read_footer(p).ok()?.meta.get("build")?.as_u64()
+/// What a snapshot file's footer says it is: its build, and a shard file's
+/// shard. None for one that doesn't read as a snapshot file.
+fn file_build(p: &Path) -> Option<(u64, Option<u64>)> {
+    let f = read_footer(p).ok()?;
+    Some((f.meta.get("build")?.as_u64()?, f.meta.get("shard").and_then(Value::as_u64)))
 }
 
-/// Removes a directory file in `files_dir` that isn't the checkpoint's
-/// build. Every build's directory file has the one name, so a copy of
-/// another build's (a peer that rebuilt) the same size would pass for this
-/// one by name and size, and the snapshot would never open. The same goes
-/// for a download of one that finished but wasn't renamed into place; one
-/// still partial doesn't read as a directory yet and resumes (a resume onto
-/// another build's bytes fails its checksums and is removed).
-fn drop_stale_dir(files_dir: &Path, lr: &LeaseResp) -> Result<()> {
+/// Removes the files in `files_dir` that the lease names but another build
+/// wrote. A file is kept by name and size, and two builds name theirs
+/// alike: every build's directory file is `directory.marco`, and a fresh
+/// build's shard files are `shard-NNN-00000000.marco`. So another build's
+/// (a peer that rebuilt) of the same size would pass for the checkpoint's,
+/// and the snapshot would never open. A local file of the lease's size is
+/// kept only if its footer names the lease's build and, for a shard file,
+/// the shard the manifest has it under, as the snapshot's open checks; one
+/// whose footer doesn't read goes too. The same goes for a download that
+/// finished but wasn't renamed into place. One still partial doesn't read
+/// as a snapshot file yet and resumes: the fetched file's checksums cover
+/// every page, so a resume onto another build's pages that differ fails
+/// them and is removed.
+fn drop_stale(files_dir: &Path, lr: &LeaseResp) -> Result<()> {
     let build = lr.manifest.get("build").and_then(Value::as_u64);
-    let local = files_dir.join(DIR_FILE);
-    let part = files_dir.join(format!("{DIR_FILE}.part"));
-    let stale = |p: &Path, whole: bool| match dir_build(p) {
-        Some(b) => Some(b) != build,
-        None => whole,
-    };
-    for (p, whole) in [(&local, true), (&part, false)] {
-        if p.exists() && stale(p, whole) {
-            std::fs::remove_file(p).with_context(|| format!("remove {}", p.display()))?;
+    let shards: BTreeMap<u32, ShardFiles> =
+        lr.manifest.get("shards").and_then(|s| serde_json::from_value(s.clone()).ok()).unwrap_or_default();
+    let shard_of: HashMap<&str, u64> =
+        shards.iter().flat_map(|(&k, f)| f.files().map(move |n| (n, u64::from(k)))).collect();
+    for f in &lr.files {
+        // the shard its footer must name: none for the directory file, and
+        // unchecked for a name the manifest doesn't place
+        let want = if f.name == DIR_FILE { Some(None) } else { shard_of.get(f.name.as_str()).map(|&k| Some(k)) };
+        let ours = |(b, shard): (u64, Option<u64>)| Some(b) == build && want.is_none_or(|w| shard == w);
+        let whole = files_dir.join(&f.name);
+        if std::fs::metadata(&whole).is_ok_and(|m| m.len() == f.bytes) && !file_build(&whole).is_some_and(ours) {
+            std::fs::remove_file(&whole).with_context(|| format!("remove {}", whole.display()))?;
+        }
+        let part = files_dir.join(format!("{}.part", f.name));
+        if part.exists() && file_build(&part).is_some_and(|got| !ours(got)) {
+            std::fs::remove_file(&part).with_context(|| format!("remove {}", part.display()))?;
         }
     }
     Ok(())
@@ -204,7 +221,8 @@ async fn fetch(
     let engine = marco_core::store::Storage::from_env()?.engine_paced(marco_core::store::io::Rate::UNLIMITED)?;
     for f in &lr.files {
         let p = files_dir.join(&f.name);
-        // a file is renamed into place only after it passed its checks, and never changes under its name
+        // a file is renamed into place only after it passed its checks, and never changes under its
+        // name within a build (drop_stale took out another build's)
         if std::fs::metadata(&p).is_ok_and(|m| m.len() == f.bytes) {
             continue;
         }
@@ -407,6 +425,163 @@ mod tests {
         let r = rt.block_on(sync(&args_for(addr, &token, &m))).unwrap();
         assert_eq!((r["fetched"].clone(), r["resumed"].clone()), (r["files"].clone(), json!(0)));
         assert_eq!(std::fs::read(m.join("files").join(DIR_FILE)).unwrap(), theirs);
+        assert!(marco_core::Graph::open(&m.join("current")).is_ok());
+    }
+
+    /// `snap`'s shard files, by name, with their bytes.
+    fn shard_files(snap: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut v: Vec<(String, Vec<u8>)> = std::fs::read_dir(snap)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("shard-"))
+            .map(|n| {
+                let b = std::fs::read(snap.join(&n)).unwrap();
+                (n, b)
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Shard files another build left in the mirror under the checkpoint's
+    /// names and sizes are fetched again rather than kept by name and size,
+    /// so the mirror opens; the checkpoint's own directory file beside them
+    /// is kept. A finished download of one that was never renamed into
+    /// place is fetched again too.
+    #[test]
+    fn shard_files_of_another_build_are_fetched_again() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (snap, addr, token, _app) = start_server(&rt, dir.path());
+        let other = dir.path().join("other");
+        marco_server::synth::write(&other, 300, 4).unwrap();
+        let (ours, theirs) = (shard_files(&snap), shard_files(&other));
+        let shape = |v: &[(String, Vec<u8>)]| v.iter().map(|(n, b)| (n.clone(), b.len())).collect::<Vec<_>>();
+        assert_eq!(shape(&ours), shape(&theirs), "another build's shard files: the same names and sizes");
+        assert!(ours.iter().zip(&theirs).all(|(a, b)| a.1 != b.1));
+        let m = dir.path().join("stale");
+        let files = m.join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::copy(snap.join(DIR_FILE), files.join(DIR_FILE)).unwrap();
+        for (n, b) in &theirs {
+            std::fs::write(files.join(n), b).unwrap();
+        }
+        let r = rt.block_on(sync(&args_for(addr, &token, &m))).unwrap();
+        assert_eq!(r["fetched"], json!(theirs.len()), "every shard file, and not the directory");
+        for (n, b) in &ours {
+            assert_eq!(&std::fs::read(files.join(n)).unwrap(), b, "{n}");
+        }
+        assert!(marco_core::Graph::open(&m.join("current")).is_ok());
+        let again = rt.block_on(sync(&args_for(addr, &token, &m))).unwrap();
+        assert_eq!(again["fetched"], 0, "the checkpoint's own files are kept");
+        // a finished download of another build's, never renamed into place
+        let m = dir.path().join("stale-part");
+        let files = m.join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        let (name, stale) = &theirs[0];
+        std::fs::write(files.join(format!("{name}.part")), stale).unwrap();
+        let r = rt.block_on(sync(&args_for(addr, &token, &m))).unwrap();
+        assert_eq!((r["fetched"].clone(), r["resumed"].clone()), (r["files"].clone(), json!(0)));
+        assert_eq!(std::fs::read(files.join(name)).unwrap(), ours[0].1);
+        assert!(marco_core::Graph::open(&m.join("current")).is_ok());
+    }
+
+    /// A file of the checkpoint's size is kept only if its footer is the one
+    /// the manifest names: one whose footer doesn't read, and this build's
+    /// file of another shard under a shard's name, are fetched again. A
+    /// checkpoint's patches read as their shard's and are kept. Without the
+    /// manifest's shards, the build alone is checked.
+    #[test]
+    fn a_file_whose_footer_isnt_the_manifests_is_fetched_again() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (snap, addr, token, app) = start_server(&rt, dir.path());
+        let ours = shard_files(&snap);
+        // a whole file of zeros: no footer
+        let m = dir.path().join("zeros");
+        let files = m.join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        let (name, bytes) = &ours[0];
+        std::fs::write(files.join(name), vec![0u8; bytes.len()]).unwrap();
+        let r = rt.block_on(sync(&args_for(addr, &token, &m))).unwrap();
+        assert_eq!(r["fetched"], r["files"]);
+        assert_eq!(&std::fs::read(files.join(name)).unwrap(), bytes);
+        assert!(marco_core::Graph::open(&m.join("current")).is_ok());
+        // this build's file of one shard under another's name, the same size
+        let (a, b) = ours
+            .iter()
+            .enumerate()
+            .flat_map(|(i, a)| ours[i + 1..].iter().map(move |b| (a, b)))
+            .find(|(a, b)| a.1.len() == b.1.len())
+            .expect("two shard files of one size");
+        let m = dir.path().join("swapped");
+        let files = m.join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::write(files.join(&a.0), &b.1).unwrap();
+        let r = rt.block_on(sync(&args_for(addr, &token, &m))).unwrap();
+        assert_eq!(r["fetched"], r["files"]);
+        assert_eq!(std::fs::read(files.join(&a.0)).unwrap(), a.1);
+        assert!(marco_core::Graph::open(&m.join("current")).is_ok());
+        // a checkpoint's patches are this build's files of their shards
+        rt.block_on(async {
+            let ops = vec![marco_server::app::Op::Add {
+                uri: format!("at://{}/app.bsky.graph.follow/3lzzzzzzzzzz2", marco_server::synth::did(7)),
+                subject: marco_server::synth::did(1),
+                list: None,
+                time_us: marco_server::app::now_ms() * 1000,
+            }];
+            app.apply(&ops, "t1").await.unwrap();
+            app.checkpoint().await.unwrap();
+        });
+        let r = rt.block_on(sync(&args_for(addr, &token, &m))).unwrap();
+        assert!(r["fetched"].as_u64().unwrap() >= 1);
+        let again = rt.block_on(sync(&args_for(addr, &token, &m))).unwrap();
+        assert_eq!(again["fetched"], 0, "the checkpoint's patches are kept");
+        // a lease whose manifest doesn't place its files: the build alone counts
+        let build = PagedFooter::read(&std::fs::read(snap.join(DIR_FILE)).unwrap()).unwrap().meta["build"].clone();
+        let lease = |manifest: Value| LeaseResp {
+            lease: String::new(),
+            checkpoint: 0,
+            manifest,
+            files: vec![FileInfo { name: a.0.clone(), bytes: b.1.len() as u64 }],
+        };
+        let files = dir.path().join("unplaced");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::write(files.join(&a.0), &b.1).unwrap();
+        drop_stale(&files, &lease(json!({"build": build}))).unwrap();
+        assert!(files.join(&a.0).exists(), "kept: this build's, and nothing says which shard");
+        drop_stale(&files, &lease(json!({"build": build.as_u64().unwrap() + 1}))).unwrap();
+        assert!(!files.join(&a.0).exists(), "another build's");
+    }
+
+    /// A partial download of another build's file resumes, since it doesn't
+    /// read as a snapshot file yet. The fetched file's checksums cover every
+    /// page, so a resume onto pages that differ fails them: the file is
+    /// removed, and the next sync fetches it from the start.
+    #[test]
+    fn a_partial_download_of_another_build_fails_once() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (snap, addr, token, _app) = start_server(&rt, dir.path());
+        // another graph: two builds of the same one can share a file's pages
+        let other = dir.path().join("other");
+        marco_server::synth::write(&other, 301, 4).unwrap();
+        let (name, bytes) = shard_files(&snap).into_iter().max_by_key(|(_, b)| b.len()).unwrap();
+        let stale = std::fs::read(other.join(&name)).unwrap();
+        let m = dir.path().join("mirror");
+        let files = m.join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        let half = stale.len().min(bytes.len()) / 2 / 4096 * 4096;
+        assert!(half > 0 && stale[..half] != bytes[..half], "another build's pages, two or more");
+        let part = files.join(format!("{name}.part"));
+        std::fs::write(&part, &stale[..half]).unwrap();
+        let e = rt.block_on(sync(&args_for(addr, &token, &m))).unwrap_err();
+        assert!(format!("{e:#}").contains("checksum"), "{e:#}");
+        assert!(!part.exists() && !m.join("current").exists());
+        let r = rt.block_on(sync(&args_for(addr, &token, &m))).unwrap();
+        assert_eq!(r["resumed"], 0);
+        assert_eq!(std::fs::read(files.join(&name)).unwrap(), bytes);
         assert!(marco_core::Graph::open(&m.join("current")).is_ok());
     }
 
