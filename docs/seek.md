@@ -132,7 +132,7 @@ Every flag has an env var. `seek serve`:
 | `--poll-seconds` | `SEEK_POLL_SECONDS` | 30 | Between source polls |
 | `--marco` | `SEEK_MARCO` | | marco's API listener |
 | `--marco-connections` | `SEEK_MARCO_CONNECTIONS` | 4 | h2 connections to marco, calls spread round-robin over them |
-| `--marco-timeout-ms` | `SEEK_MARCO_TIMEOUT_MS` | 500 | Each marco call |
+| `--marco-timeout-ms` | `SEEK_MARCO_TIMEOUT_MS` | 500 | Each marco call, its retry included. A call that fails in transit (a connection refused or reset, a GOAWAY, a stream reset) or with `unavailable` (a 503 on the way, or a marco that can't serve it now) is tried once more on a fresh connection. They're all reads, so a second try is safe |
 | `--viewer-deadline-ms` | `SEEK_VIEWER_DEADLINE_MS` | 2000 | A viewer's follows and mutuals, every page. Past it the query answers without follows first; blocks are still filtered. 0 turns follows first off |
 | `--max-follows` | `SEEK_MAX_FOLLOWS` | 5000 | A viewer following more gets no follows first, though blocks are still filtered. One marco Counts call decides, and the cache keeps the verdict. Just past the 95th percentile of accounts that post mentions (Viewer builds, below) |
 | `--viewer-cache-mb` | `SEEK_VIEWER_CACHE_MB` | 1024 | The viewer cache's weighed size, about 13 KB a viewer. 1 GiB holds every account that posted a mention in two days, 783 MB of them |
@@ -214,7 +214,8 @@ thread, as marco's op histograms are.
 | `seek_viewer_builds_unkept_total` | | Builds used for their query but not cached, as a follow event for the viewer came during or just before marco's read |
 | `seek_viewer_build_seconds`, `seek_viewer_keys_seconds`, `seek_viewer_follows` | | A viewer's entry from marco, its keys found in an artifact, and each built viewer's follow count |
 | `seek_marco_seconds` | `method`: `filter`, `list_out`, `intersect`, `counts` | |
-| `seek_marco_errors_total` | `method`, `kind`: `timeout`, `unavailable`, `other` | |
+| `seek_marco_errors_total` | `method`, `kind`: `timeout`, `unavailable`, `other` | Calls that failed, their retry included |
+| `seek_marco_retries_total` | `method` | Calls tried a second time on a fresh connection. A slot's connection is replaced at most once a second |
 | `seek_artifact_info` | `version` | 1 for the artifact served |
 | `seek_artifact_built_timestamp_seconds`, `seek_artifact_cursor_timestamp_seconds`, `seek_artifact_age_seconds` | | |
 | `seek_artifact_build_seconds`, `seek_artifact_actors`, `seek_artifact_mapped_bytes` | | |

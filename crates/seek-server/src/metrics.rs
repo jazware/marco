@@ -112,6 +112,11 @@ pub static MARCO_ERRS: LazyLock<IntCounterVec> = counter_vec!(
     "marco calls that failed, by method and kind (timeout, unavailable, other)",
     &["method", "kind"]
 );
+pub static MARCO_RETRIES: LazyLock<IntCounterVec> = counter_vec!(
+    "seek_marco_retries_total",
+    "marco calls tried a second time on a fresh connection, after a failure in transit or unavailable, by method",
+    &["method"]
+);
 
 // ---- the artifact
 pub static ARTIFACT_INFO: LazyLock<IntGaugeVec> = LazyLock::new(|| {
@@ -247,6 +252,7 @@ pub fn init() {
     LazyLock::force(&INGEST_PANICS);
     for m in MARCO_METHODS {
         MARCO_SECONDS.with(&[m]);
+        MARCO_RETRIES.with_label_values(&[m]);
         for k in MARCO_ERRORS {
             MARCO_ERRS.with_label_values(&[m, k]);
         }

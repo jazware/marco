@@ -2,7 +2,8 @@
 //! graph) and a builder-made artifact, over Connect and gRPC: logged out by
 //! rank, logged in with follows first, blocks dropped both ways (spaced
 //! queries' matches too), an exact handle kept through a block, the overlay's
-//! changes, a swap, and the drain on the way out.
+//! changes, a swap, and the drain on the way out. And seek's marco client
+//! through a Service-like proxy, its marco going away under it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +38,13 @@ fn tid(k: u64) -> String {
 }
 
 async fn marco() -> (std::net::SocketAddr, tempfile::TempDir) {
+    let (_, api, dir) = marco_app(true).await;
+    (api, dir)
+}
+
+/// A marco on the small graph. Without `block_d`, V follows D instead of blocking them, so a
+/// filter's answer shows which marco gave it.
+async fn marco_app(block_d: bool) -> (Arc<marco_server::app::App>, std::net::SocketAddr, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let mut g = marco_core::Graph::new(marco_core::Relations::bsky_default());
     let mut k = 0;
@@ -50,7 +58,7 @@ async fn marco() -> (std::net::SocketAddr, tempfile::TempDir) {
     rec(&mut g, V, "app.bsky.graph.follow", G);
     rec(&mut g, V, "app.bsky.graph.follow", H);
     rec(&mut g, C, "app.bsky.graph.block", V);
-    rec(&mut g, V, "app.bsky.graph.block", D);
+    rec(&mut g, V, if block_d { "app.bsky.graph.block" } else { "app.bsky.graph.follow" }, D);
     rec(&mut g, V, "app.bsky.graph.block", F);
     rec(&mut g, V, "app.bsky.graph.block", I);
     rec(&mut g, B, "app.bsky.graph.follow", C);
@@ -58,8 +66,8 @@ async fn marco() -> (std::net::SocketAddr, tempfile::TempDir) {
     g.write_snapshot(&snap).unwrap();
     let app = marco_server::app::App::open(marco_server::app::Config::new(snap)).unwrap();
     let ui = Arc::new(marco_server::ui::Ui::load(None).unwrap());
-    let (api, _admin) = marco_server::serve(app, ui).await.unwrap();
-    (api, dir)
+    let (api, _admin) = marco_server::serve(app.clone(), ui).await.unwrap();
+    (app, api, dir)
 }
 
 fn state(cursor_us: u64) -> State {
@@ -584,4 +592,146 @@ async fn load_sweeps() {
         assert!(s["latency"]["n"].as_u64().unwrap() >= 70, "{s}");
         assert!(open["stopped"].as_str().unwrap().starts_with("saturated"), "{open}");
     }
+}
+
+/// A TCP proxy, as a Kubernetes Service is to its pods: each new connection goes to the next of its
+/// backends in turn and stays there. [`Proxy::cut`] kills the connections open now, as a pod dying
+/// under them would: the next bytes a client sends on one get a reset.
+struct Proxy {
+    addr: std::net::SocketAddr,
+    to: Arc<std::sync::Mutex<(Vec<std::net::SocketAddr>, usize)>>,
+    cut: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+impl Proxy {
+    async fn start(to: Vec<std::net::SocketAddr>) -> Proxy {
+        use tokio::io::AsyncReadExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let to = Arc::new(std::sync::Mutex::new((to, 0)));
+        let cut = Arc::new(tokio::sync::watch::channel(0u64).0);
+        let (routes, cuts) = (to.clone(), cut.clone());
+        tokio::spawn(async move {
+            loop {
+                let (client, _) = l.accept().await.unwrap();
+                let backend = {
+                    let mut r = routes.lock().unwrap();
+                    r.1 += 1;
+                    r.0[(r.1 - 1) % r.0.len()]
+                };
+                let mut cut = cuts.subscribe();
+                tokio::spawn(async move {
+                    let Ok(up) = tokio::net::TcpStream::connect(backend).await else { return };
+                    let (mut cr, mut cw) = client.into_split();
+                    let (mut ur, mut uw) = up.into_split();
+                    let was_cut = tokio::select! {
+                        _ = tokio::io::copy(&mut cr, &mut uw) => false,
+                        _ = tokio::io::copy(&mut ur, &mut cw) => false,
+                        _ = cut.changed() => true,
+                    };
+                    if was_cut {
+                        drop((ur, uw));
+                        let _ = cr.read(&mut [0u8; 1]).await;
+                        let _ = cr.reunite(cw).unwrap().set_zero_linger();
+                    }
+                });
+            }
+        });
+        Proxy { addr, to, cut }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// Connections made since the last [`Proxy::route`].
+    fn conns(&self) -> usize {
+        self.to.lock().unwrap().1
+    }
+
+    /// New connections go to `to` from now on.
+    fn route(&self, to: Vec<std::net::SocketAddr>) {
+        *self.to.lock().unwrap() = (to, 0);
+    }
+
+    fn cut(&self) {
+        self.cut.send_modify(|n| *n += 1);
+    }
+}
+
+/// A server answering everything 503: a proxy on the way whose upstream is gone.
+async fn unavailable() -> std::net::SocketAddr {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let r = axum::Router::new().fallback(|| async { (http::StatusCode::SERVICE_UNAVAILABLE, "no healthy upstream") });
+    tokio::spawn(async move { axum::serve(l, r).await });
+    addr
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn marco_calls_survive_their_marco_going() {
+    use seek_server::marco::Marco;
+    seek_server::metrics::init();
+    let h = seek_server::metrics::QueryHists::new();
+    let retries = || seek_server::metrics::MARCO_RETRIES.with_label_values(&["filter"]).get();
+    let client = |p: &Proxy| Marco::new(&p.url(), 1, Duration::from_secs(5), 10_000).unwrap();
+    // V blocks D on A, and follows D on B
+    let (a, a_addr, _ad) = marco_app(true).await;
+    let (_b, b_addr, _bd) = marco_app(false).await;
+    let (on_a, on_b) = (vec![did(E)], vec![did(D), did(E)]);
+    async fn filter(m: &Marco, h: &seek_server::metrics::QueryHists) -> Vec<String> {
+        m.unblocked(&did(V), vec![did(D), did(E)], h).await.unwrap()
+    }
+
+    // A dies under the open connection: the call meets a reset, and its retry dials again and lands
+    // on B
+    let p = Proxy::start(vec![a_addr]).await;
+    let m = client(&p);
+    assert_eq!(filter(&m, &h).await, on_a);
+    p.route(vec![b_addr]);
+    p.cut();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let r0 = retries();
+    assert_eq!(filter(&m, &h).await, on_b);
+    assert_eq!(retries(), r0 + 1);
+    // and the slot keeps the fresh connection
+    assert_eq!(filter(&m, &h).await, on_b);
+    assert_eq!(retries(), r0 + 1);
+
+    // a proxy on the way answers 503: the retry's fresh connection goes to the next backend, B
+    let gone = unavailable().await;
+    let p = Proxy::start(vec![gone, b_addr]).await;
+    let m = client(&p);
+    let r0 = retries();
+    assert_eq!(filter(&m, &h).await, on_b);
+    assert_eq!(retries(), r0 + 1);
+
+    // 503 everywhere: a slot's client is replaced at most once a second, so failing calls don't
+    // dial a connection each
+    let p = Proxy::start(vec![gone, gone, b_addr]).await;
+    let m = client(&p);
+    let v = did(V);
+    let ask = || m.unblocked(&v, vec![did(D), did(E)], &h);
+    let r0 = retries();
+    assert!(ask().await.is_err());
+    assert_eq!((p.conns(), retries()), (2, r0 + 1), "the first failure replaces the client");
+    assert!(ask().await.is_err());
+    assert_eq!((p.conns(), retries()), (2, r0 + 2), "a second within the second retries on it");
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(ask().await.unwrap(), on_b);
+    assert_eq!((p.conns(), retries()), (3, r0 + 3));
+
+    // A stops cleanly: a call during its drain still answers there, and after its GOAWAY the next
+    // one dials again and lands on B, with no retry
+    let p = Proxy::start(vec![a_addr]).await;
+    let m = client(&p);
+    assert_eq!(filter(&m, &h).await, on_a);
+    p.route(vec![b_addr]);
+    a.drain.lame_duck();
+    assert_eq!(filter(&m, &h).await, on_a);
+    assert!(a.drain.stop(Duration::from_secs(5)).await);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let r0 = retries();
+    assert_eq!(filter(&m, &h).await, on_b);
+    assert_eq!(retries(), r0, "a GOAWAY needs no retry");
 }
