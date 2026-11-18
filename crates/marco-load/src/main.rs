@@ -9,7 +9,7 @@
 //! marco-load replay --snapshot FILE --deletes DIR   delete-by-URI replay through the mutable path
 //! marco-load diff   --a SNAP --b SNAP              two snapshots compared record by record
 //! marco-load pagerank --snapshot DIR [--link DIR] --out-dir DIR   PageRank over the follows, a ranks file (daily: warm from the last)
-//! marco-load mirror --url ADMIN --dir DIR      a local copy of a running marco's checkpoint
+//! marco-load mirror --url ADMIN --dir DIR [--relations TOML]   a local copy of a running marco's checkpoint (exit 3: other relations)
 //! marco-load scan-scylla --config TOML --out DIR [--snapshot SNAP]   Scylla tables -> build input (-> snapshot)
 //! marco-load fill-scylla --config TOML --input DIR   build input -> Scylla tables (tests, benchmarks)
 //! marco-load scan-hubble --out DIR [--host URL] [--snapshot SNAP]   a sync-API host's repos -> build input (-> snapshot)
@@ -186,7 +186,14 @@ fn main() -> Result<()> {
         Cmd::Diff(a) => diff::run(&a)?,
         Cmd::Pagerank(a) => pagerank::run(&a)?,
         #[cfg(feature = "hubble")]
-        Cmd::Mirror(a) => mirror::run(&a)?,
+        Cmd::Mirror(a) => match mirror::run(&a) {
+            // its own exit code, so a script can tell it from a failed fetch
+            Err(e) if e.is::<mirror::RelationsDiffer>() => {
+                eprintln!("Error: {e:#}");
+                std::process::exit(mirror::RELATIONS_DIFFER.into());
+            }
+            r => r?,
+        },
         #[cfg(feature = "scylla")]
         Cmd::ScanScylla(a) => cql::scan::run(&a)?,
         #[cfg(feature = "scylla")]

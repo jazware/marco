@@ -10,6 +10,11 @@
 //!
 //! The first run copies the whole snapshot; later ones only what the
 //! checkpoints since wrote (their patches and new bases).
+//!
+//! With `--relations FILE` it fetches the directory file first, which holds
+//! the snapshot's relations, and stops with [`RELATIONS_DIFFER`] before any
+//! other file if they aren't FILE's: a replica seeded from its peer then
+//! serves the relations its config names, or none.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom};
@@ -17,8 +22,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
+use marco_core::relation::RELATION_KEYS;
 use marco_core::snapshot::{PagedFooter, TRAILER};
 use marco_core::store::{ShardFiles, DIR_FILE};
+use marco_core::{Relation, Relations};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -39,7 +46,27 @@ pub struct Args {
     /// Only report what's there and what a sync would fetch.
     #[arg(long)]
     peek: bool,
+    /// A relations config (TOML) the checkpoint has to hold: the same relations in the same
+    /// order, each with the same keys. Checked on the directory file, fetched first; otherwise
+    /// the mirror exits with code 3 before it fetches any other file.
+    #[arg(long, conflicts_with = "peek")]
+    relations: Option<PathBuf>,
 }
+
+/// The exit code of a mirror refused for its relations (`--relations`).
+pub const RELATIONS_DIFFER: u8 = 3;
+
+/// The checkpoint's relations aren't `--relations`'s: no file past the directory was fetched.
+#[derive(Debug)]
+pub struct RelationsDiffer(pub String);
+
+impl std::fmt::Display for RelationsDiffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the checkpoint's relations differ from --relations: {}", self.0)
+    }
+}
+
+impl std::error::Error for RelationsDiffer {}
 
 #[derive(Deserialize)]
 struct FileInfo {
@@ -95,6 +122,12 @@ async fn sync(a: &Args) -> Result<Value> {
             auth(c.get(format!("{base}/admin/checkpoint?peek=1"))).send().await?.error_for_status()?.json().await?;
         return Ok(json!({"marco": v, "mirror": current_checkpoint(&a.dir)}));
     }
+    let want = match &a.relations {
+        Some(p) => {
+            Some(Relations::parse_toml(&std::fs::read_to_string(p).with_context(|| format!("read {}", p.display()))?)?)
+        }
+        None => None,
+    };
     let lr: LeaseResp = auth(c.get(format!("{base}/admin/checkpoint?ttl={}", a.lease_seconds)))
         .send()
         .await?
@@ -108,10 +141,20 @@ async fn sync(a: &Args) -> Result<Value> {
     }
     let files_dir = a.dir.join("files");
     std::fs::create_dir_all(&files_dir)?;
-    let r = match drop_stale(&files_dir, &lr) {
-        Ok(()) => fetch(&c, &auth, &base, &lr, &files_dir).await,
-        Err(e) => Err(e),
-    };
+    let r = async {
+        drop_stale(&files_dir, &lr)?;
+        let mut first = (0, 0, 0);
+        if let Some(want) = &want {
+            // the directory file names the relations: fetched and checked before any other
+            let d = lr.files.iter().find(|f| f.name == DIR_FILE).context("the lease names no directory file")?;
+            first = fetch(&c, &auth, &base, &lr.lease, std::slice::from_ref(d), &files_dir).await?;
+            check_relations(&files_dir.join(DIR_FILE), want)?;
+        }
+        // a file already there by name and size isn't fetched again
+        let rest = fetch(&c, &auth, &base, &lr.lease, &lr.files, &files_dir).await?;
+        anyhow::Ok((first.0 + rest.0, first.1 + rest.1, first.2 + rest.2))
+    }
+    .await;
     let _ = auth(c.delete(format!("{base}/admin/checkpoint?lease={}", lr.lease))).send().await;
     let (fetched, bytes, resumed) = r?;
 
@@ -146,7 +189,7 @@ async fn sync(a: &Args) -> Result<Value> {
     Ok(json!({
         "checkpoint": lr.checkpoint, "files": lr.files.len(), "fetched": fetched, "resumed": resumed,
         "bytes_fetched": bytes, "bytes_total": lr.files.iter().map(|f| f.bytes).sum::<u64>(), "dropped": dropped,
-        "secs": t0.elapsed().as_secs_f64(), "snapshot": snap,
+        "secs": t0.elapsed().as_secs_f64(), "snapshot": snap, "relations_checked": want.is_some(),
     }))
 }
 
@@ -207,11 +250,47 @@ fn drop_stale(files_dir: &Path, lr: &LeaseResp) -> Result<()> {
     Ok(())
 }
 
+/// Fails with [`RelationsDiffer`] unless the directory file at `p` holds `want`'s relations.
+fn check_relations(p: &Path, want: &Relations) -> Result<()> {
+    let footer = read_footer(p).with_context(|| format!("{}'s footer", p.display()))?;
+    if footer.kind != "dir" {
+        bail!("{} isn't a directory file", p.display());
+    }
+    let have = footer.meta.get("relations").and_then(Value::as_array).context("the directory meta has no relations")?;
+    match relations_differ(have, want) {
+        Some(why) => Err(RelationsDiffer(why).into()),
+        None => Ok(()),
+    }
+}
+
+/// How a snapshot's relations (its directory meta's, as JSON) differ from
+/// `want`'s, or None: the same names in the same order, companions included,
+/// and each with the same keys holding the same values. A key this binary
+/// doesn't know is a difference, since a relations config can't hold one.
+fn relations_differ(have: &[Value], want: &Relations) -> Option<String> {
+    let have_names: Vec<&str> = have.iter().map(|r| r.get("name").and_then(Value::as_str).unwrap_or("?")).collect();
+    let want_names: Vec<&str> = want.list.iter().map(|r| r.name.as_str()).collect();
+    if have_names != want_names {
+        return Some(format!("the checkpoint has [{}], the config [{}]", have_names.join(", "), want_names.join(", ")));
+    }
+    for (h, w) in have.iter().zip(&want.list) {
+        if let Some(k) = h.as_object().and_then(|o| o.keys().find(|k| !RELATION_KEYS.contains(&k.as_str()))) {
+            return Some(format!("{}: the checkpoint's has {k:?}, a key this marco-load doesn't know", w.name));
+        }
+        if serde_json::from_value::<Relation>(h.clone()).ok().as_ref() != Some(w) {
+            let config = serde_json::to_string(w).unwrap_or_default();
+            return Some(format!("{}: the checkpoint's is {h}, the config's {config}", w.name));
+        }
+    }
+    None
+}
+
 async fn fetch(
     c: &reqwest::Client,
     auth: &impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
     base: &str,
-    lr: &LeaseResp,
+    lease: &str,
+    files: &[FileInfo],
     files_dir: &Path,
 ) -> Result<(usize, u64, usize)> {
     use futures::StreamExt;
@@ -219,7 +298,7 @@ async fn fetch(
     let (mut fetched, mut bytes, mut resumed) = (0, 0u64, 0);
     // unpaced: this reads the local disk, not marco's
     let engine = marco_core::store::Storage::from_env()?.engine_paced(marco_core::store::io::Rate::UNLIMITED)?;
-    for f in &lr.files {
+    for f in files {
         let p = files_dir.join(&f.name);
         // a file is renamed into place only after it passed its checks, and never changes under its
         // name within a build (drop_stale took out another build's)
@@ -233,7 +312,7 @@ async fn fetch(
             from = 0;
         }
         if from < f.bytes {
-            let mut req = auth(c.get(format!("{base}/admin/checkpoint/files/{}?lease={}", f.name, lr.lease)));
+            let mut req = auth(c.get(format!("{base}/admin/checkpoint/files/{}?lease={lease}", f.name)));
             if from > 0 {
                 req = req.header(reqwest::header::RANGE, format!("bytes={from}-"));
                 resumed += 1;
@@ -310,6 +389,7 @@ mod tests {
             dir: dir.to_path_buf(),
             lease_seconds: 60,
             peek: false,
+            relations: None,
         };
         let m = dir.path().join("mirror");
         let first = rt.block_on(sync(&args(&m))).unwrap();
@@ -392,6 +472,7 @@ mod tests {
             dir: dir.to_path_buf(),
             lease_seconds: 60,
             peek: false,
+            relations: None,
         }
     }
 
@@ -643,5 +724,153 @@ mod tests {
         let r = rt.block_on(sync(&args_for(addr, &token, &m))).unwrap();
         assert_eq!(r["resumed"], 0);
         assert_eq!(std::fs::read(files.join(&name)).unwrap(), bytes);
+    }
+
+    const FOLLOW: &str =
+        "[[relation]]\nname = \"follow\"\ncollection = \"app.bsky.graph.follow\"\nsubject = \"subject\"\n\n";
+    const BLOCK: &str =
+        "[[relation]]\nname = \"block\"\ncollection = \"app.bsky.graph.block\"\nsubject = \"subject\"\n\n";
+    const LISTITEM: &str =
+        "[[relation]]\nname = \"listitem\"\ncollection = \"app.bsky.graph.listitem\"\nsubject = \"subject\"\nlist = \"list\"\n\n";
+    const LISTBLOCK: &str = "[[relation]]\nname = \"listblock\"\ncollection = \"app.bsky.graph.listblock\"\n\
+                             subject = \"subject\"\nsubject_collection = \"app.bsky.graph.list\"\n\n";
+    const MODLIST: &str =
+        "[[relation]]\nname = \"modlist\"\ncollection = \"app.bsky.graph.list\"\nsubject = \"$self\"\n\
+                           when = { purpose = \"app.bsky.graph.defs#modlist\" }\n\n";
+
+    /// The defaults as a relations config: what synth writes.
+    fn defaults() -> String {
+        [FOLLOW, BLOCK, LISTITEM].concat()
+    }
+
+    /// The defaults with the list subjects' relations after them.
+    fn with_list_subjects() -> String {
+        [FOLLOW, BLOCK, LISTITEM, LISTBLOCK, MODLIST].concat()
+    }
+
+    fn rels(toml: &str) -> Relations {
+        Relations::parse_toml(toml).unwrap()
+    }
+
+    /// Relations differ by name, by order, and by any key's value, a key
+    /// added or one left out; a key this binary doesn't know differs too. A
+    /// snapshot written before the new keys existed is the same as a config
+    /// without them, and a config's layout doesn't matter.
+    #[test]
+    fn relations_compare_by_name_order_and_key() {
+        let base = rels(&defaults());
+        let json = |r: &Relations| serde_json::to_value(&r.list).unwrap().as_array().unwrap().clone();
+        assert_eq!(relations_differ(&json(&base), &base), None);
+        // an older marco's directory: no subject_collection or when, nothing written for them
+        let old: Vec<Value> = serde_json::from_str(
+            r#"[{"name":"follow","collection":"app.bsky.graph.follow","subject":"subject"},
+                {"name":"block","collection":"app.bsky.graph.block","subject":"subject"},
+                {"name":"listitem","collection":"app.bsky.graph.listitem","subject":"subject","list":"list"},
+                {"name":"listitem.owner","collection":"app.bsky.graph.listitem","subject":"list","owner_of":"listitem"}]"#,
+        )
+        .unwrap();
+        assert_eq!(relations_differ(&old, &base), None);
+        let more = rels(&with_list_subjects());
+        assert_eq!(relations_differ(&json(&more), &more), None);
+        let differ = |have: &Relations, want: &Relations| relations_differ(&json(have), want).is_some();
+        assert!(differ(&base, &more) && differ(&more, &base), "names: added or left out");
+        assert!(differ(&rels(&[BLOCK, FOLLOW, LISTITEM].concat()), &base), "order");
+        let m = with_list_subjects();
+        for (key, edited) in [
+            ("collection", m.replace("app.bsky.graph.listblock", "app.bsky.graph.listblocks")),
+            ("subject", m.replace("subject = \"subject\"\nlist", "subject = \"member\"\nlist")),
+            (
+                "subject_collection",
+                m.replace(
+                    "subject_collection = \"app.bsky.graph.list\"",
+                    "subject_collection = \"app.bsky.graph.lists\"",
+                ),
+            ),
+            ("subject_collection left out", m.replace("subject_collection = \"app.bsky.graph.list\"\n", "")),
+            ("list", m.replace("list = \"list\"", "list = \"group\"")),
+            ("when", m.replace("defs#modlist", "defs#curatelist")),
+            ("when left out", m.replace("when = { purpose = \"app.bsky.graph.defs#modlist\" }\n", "")),
+            (
+                "when added",
+                m.replacen("subject = \"subject\"\n\n", "subject = \"subject\"\nwhen = { a = \"b\" }\n\n", 1),
+            ),
+        ] {
+            assert_ne!(edited, m, "{key}: the edit didn't apply");
+            assert!(differ(&rels(&edited), &more), "{key}");
+            assert!(differ(&more, &rels(&edited)), "{key}");
+        }
+        // a key from a newer marco: this one can't say what it means
+        let mut newer = json(&base);
+        newer[0].as_object_mut().unwrap().insert("since".into(), json!("2027"));
+        let why = relations_differ(&newer, &base).unwrap();
+        assert!(why.contains("since"), "{why}");
+        // the same relations laid out otherwise: a comment, another key order
+        let relaid = "# ours\n[[relation]]\nsubject = \"subject\"\nname = \"follow\"\ncollection = \"app.bsky.graph.follow\"\n\n";
+        assert_eq!(relations_differ(&json(&base), &rels(&[relaid, BLOCK, LISTITEM].concat())), None);
+    }
+
+    /// With --relations, a checkpoint whose relations differ is refused once
+    /// its directory file is in, before any other file: no shard file, no
+    /// `current`. The same relations mirror whole, and a mirror without the
+    /// flag takes any.
+    #[test]
+    fn refuses_a_checkpoint_whose_relations_differ() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (snap, addr, token, _app) = start_server(&rt, dir.path());
+        let file = |name: &str, toml: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, toml).unwrap();
+            p
+        };
+        let cases = [
+            ("added", with_list_subjects()),
+            ("left out", [FOLLOW, BLOCK].concat()),
+            ("another order", [BLOCK, FOLLOW, LISTITEM].concat()),
+            ("a key", defaults().replace("list = \"list\"", "list = \"group\"")),
+        ];
+        for (i, (why, toml)) in cases.iter().enumerate() {
+            let m = dir.path().join(format!("refused-{i}"));
+            let a = Args { relations: Some(file(&format!("r{i}.toml"), toml)), ..args_for(addr, &token, &m) };
+            let e = rt.block_on(sync(&a)).unwrap_err();
+            assert!(e.is::<RelationsDiffer>(), "{why}: {e:#}");
+            let got: Vec<String> = std::fs::read_dir(m.join("files"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(got, [DIR_FILE], "{why}: only the directory file");
+            assert!(!m.join("current").exists());
+        }
+        let m = dir.path().join("same");
+        let a = Args { relations: Some(file("same.toml", &defaults())), ..args_for(addr, &token, &m) };
+        let r = rt.block_on(sync(&a)).unwrap();
+        assert_eq!((r["fetched"].clone(), r["relations_checked"].clone()), (r["files"].clone(), json!(true)));
+        assert!(marco_core::Graph::open(&m.join("current")).is_ok());
+        // again: the directory file is there by name and size, so nothing is fetched
+        let again = rt.block_on(sync(&a)).unwrap();
+        assert_eq!(again["fetched"], 0);
+        // no flag: whatever the relations, as before
+        let m = dir.path().join("unchecked");
+        let r = rt.block_on(sync(&args_for(addr, &token, &m))).unwrap();
+        assert_eq!((r["fetched"].clone(), r["relations_checked"].clone()), (r["files"].clone(), json!(false)));
+        // a directory file of another build, the same size, left in the mirror: it isn't the
+        // checkpoint's, so it's fetched again rather than checked
+        let other = dir.path().join("other");
+        marco_server::synth::write(&other, 300, 4).unwrap();
+        let theirs = std::fs::read(snap.join(DIR_FILE)).unwrap();
+        let stale = std::fs::read(other.join(DIR_FILE)).unwrap();
+        assert!(stale.len() == theirs.len() && stale != theirs, "a same-sized directory of another build");
+        let m = dir.path().join("stale");
+        std::fs::create_dir_all(m.join("files")).unwrap();
+        std::fs::write(m.join("files").join(DIR_FILE), &stale).unwrap();
+        let a = Args { relations: Some(file("same.toml", &defaults())), ..args_for(addr, &token, &m) };
+        let r = rt.block_on(sync(&a)).unwrap();
+        assert_eq!(r["fetched"], r["files"]);
+        assert_eq!(std::fs::read(m.join("files").join(DIR_FILE)).unwrap(), theirs);
+        // a config that doesn't parse is an error before any lease, not a difference
+        let a =
+            Args { relations: Some(file("bad.toml", "[[relation]]\nname = \"x\"\n")), ..args_for(addr, &token, &m) };
+        let e = rt.block_on(sync(&a)).unwrap_err();
+        assert!(!e.is::<RelationsDiffer>(), "{e:#}");
     }
 }
