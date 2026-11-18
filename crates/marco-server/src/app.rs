@@ -364,6 +364,8 @@ pub struct App {
     pub compacted_at: Mutex<VecDeque<i64>>,
     /// What Relationships and BlockPairs answer.
     pub relationships: RelationshipSet,
+    /// The listeners' clean stop (`--shutdown-drain-secs`): `/readyz` is 503 once it begins.
+    pub drain: marco_ops::drain::Drain,
 }
 
 pub fn now_ms() -> i64 {
@@ -608,6 +610,7 @@ impl App {
             resident: AtomicBool::new(resident),
             garbage_bytes: AtomicU64::new(0),
             compacted_at: Mutex::new(VecDeque::new()),
+            drain: marco_ops::drain::Drain::new(),
         });
         if let Some(spare) = spare {
             let tx = writer::spawn(app.clone(), spare, writer::Init { cursors, segment: last, ops });

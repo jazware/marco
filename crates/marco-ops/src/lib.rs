@@ -14,6 +14,10 @@
 //! admin token. [`serve`], marco-load's endpoint, checks no one, so bind it
 //! to loopback. Only it has the sink, which `marco-load bench --otlp`
 //! exports its spans to.
+//!
+//! [`drain`] stops a process's listeners cleanly behind a load balancer.
+
+pub mod drain;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock};

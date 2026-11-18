@@ -105,7 +105,8 @@ async fn read_header(s: &mut TcpStream) -> Result<String, String> {
 /// A TCP listener that reads the header off each connection from `from`
 /// (closing one without a good header) and passes every other connection
 /// through as it is. Headers are read off the accept loop, so a slow one
-/// holds up nobody else.
+/// holds up nobody else. Dropping it closes the socket: a connect after
+/// that is refused.
 pub struct PeerListener {
     rx: mpsc::Receiver<(TcpStream, Peer)>,
     local: SocketAddr,
@@ -118,7 +119,10 @@ impl PeerListener {
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
             loop {
-                let (mut s, addr) = axum::serve::Listener::accept(&mut l).await;
+                let (mut s, addr) = tokio::select! {
+                    c = axum::serve::Listener::accept(&mut l) => c,
+                    _ = tx.closed() => return,
+                };
                 // Without TCP_NODELAY, an HTTP/2 response written as two
                 // frames waits on the client's delayed ACK: 40 ms for a page.
                 let _ = s.set_nodelay(true);

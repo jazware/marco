@@ -190,6 +190,15 @@ struct Serve {
     /// starts at the live tail).
     #[arg(long, env = "MARCO_ALLOW_GAP")]
     allow_gap: bool,
+    /// On SIGTERM or Ctrl-C, /readyz answers 503 and every listener keeps serving this many
+    /// seconds, so a load balancer takes marco out first (0: stop at once; a second signal cuts it
+    /// short).
+    #[arg(long, env = "MARCO_SHUTDOWN_DRAIN_SECS", default_value_t = 10.0)]
+    shutdown_drain_secs: f64,
+    /// Then the listeners stop accepting, HTTP/2 connections get a GOAWAY, and the requests in flight
+    /// have this many seconds to finish before ingest stops and the last segment is written.
+    #[arg(long, env = "MARCO_SHUTDOWN_GRACE_SECS", default_value_t = 10.0)]
+    shutdown_grace_secs: f64,
 }
 
 fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
@@ -235,6 +244,8 @@ fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
         ("firehose", s.firehose.clone().unwrap_or_else(|| "—".into())),
         ("source_retention_hours", s.source_retention_hours.to_string()),
         ("allow_gap", s.allow_gap.to_string()),
+        ("shutdown_drain_secs", s.shutdown_drain_secs.to_string()),
+        ("shutdown_grace_secs", s.shutdown_grace_secs.to_string()),
     ];
     rows.into_iter()
         .map(|(id, value)| {
@@ -318,14 +329,6 @@ fn auth(s: &Serve) -> Result<AuthConfig> {
     })
 }
 
-async fn shutdown_signal() {
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
-    }
-}
-
 fn main() -> Result<()> {
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches)?;
@@ -372,6 +375,8 @@ fn main() -> Result<()> {
             if s.via_max_records == 0 {
                 bail!("--via-max-records must be at least 1");
             }
+            let drain = marco_ops::drain::secs("--shutdown-drain-secs", s.shutdown_drain_secs)?;
+            let grace = marco_ops::drain::secs("--shutdown-grace-secs", s.shutdown_grace_secs)?;
             let cfg = Config {
                 read_only: s.read_only,
                 api_read_only: s.api_read_only,
@@ -436,7 +441,13 @@ fn main() -> Result<()> {
                     }
                     None => None,
                 };
-                shutdown_signal().await;
+                marco_ops::drain::signal().await;
+                eprintln!(
+                    "stopping: /readyz is 503; serving {drain:?} more (another signal cuts it short), then up to {grace:?} for requests in flight"
+                );
+                if !app.drain.run(drain, grace).await {
+                    eprintln!("requests still in flight after --shutdown-grace-secs: stopping anyway");
+                }
                 let _ = stop.send(true);
                 if let Some(t) = ingest {
                     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), t).await;

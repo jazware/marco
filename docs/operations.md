@@ -2,7 +2,7 @@
 title: Operations
 section: Operations
 order: 100
-summary: "Running marco serve: the two listeners, every flag and its env var, the metrics, profiling and tracing, and the console."
+summary: "Running marco serve: the two listeners, every flag and its env var, health and a clean stop, the metrics, profiling and tracing, and the console."
 ---
 
 ```hero
@@ -127,6 +127,8 @@ console's Settings page shows each one's value and where it came from.
 | `--ui-dir` | `MARCO_UI_DIR` | the embedded build | A built console and docs (`ui/dist`) to serve instead of the ones built into the binary. |
 | `--public-url` | `MARCO_PUBLIC_URL` | | The API listener's public origin (`https://marco.example.com`). The docs' and landing page's card tags use it, and the docs' read examples point at it. |
 | `--handle-resolver` | `MARCO_HANDLE_RESOLVER` | off | An XRPC host for `com.atproto.identity.resolveHandle` (`https://public.api.bsky.app`), behind `/resolve` for the explorer. |
+| `--shutdown-drain-secs` | `MARCO_SHUTDOWN_DRAIN_SECS` | 10 | On SIGTERM or Ctrl-C, how long `/readyz` answers 503 while every listener keeps serving ([Stopping](#stopping)). 0 stops at once. |
+| `--shutdown-grace-secs` | `MARCO_SHUTDOWN_GRACE_SECS` | 10 | Then, once the listeners stop accepting, how long the requests in flight have to finish. |
 
 `marco synth --out DIR [--actors N] [--shards N]` writes a synthetic snapshot with fake DIDs, for
 trying the console and the API without data.
@@ -138,7 +140,35 @@ trying the console and the API without data.
   why ([the ready gate](durability.md#the-ready-gate)). It also answers 503 `storage failing`
   while 64 or more distinct pages have failed their reads on the device (EIO after retries, or
   short) in the last 60 s: the disk is going. A few bad pages leave it ready; their requests fail
-  with `data_loss` or `unavailable` naming the page.
+  with `data_loss` or `unavailable` naming the page. From SIGTERM on it answers 503
+  `shutting down` ([Stopping](#stopping)).
+
+## Stopping
+
+```steps
+- title: SIGTERM or Ctrl-C
+  body: "`/readyz` answers 503 `shutting down` on both listeners, and every listener keeps serving for `--shutdown-drain-secs` (10 s): reads, writes and new connections. Each HTTP/1 answer says `Connection: close`, so a keep-alive client dials again. A second signal ends the drain early."
+- title: Stop accepting
+  body: "The listeners close, so a new connection is refused. Each HTTP/2 connection gets a GOAWAY, and its client opens its next stream on a new connection. An idle HTTP/1 connection closes."
+- title: Finish what's in flight
+  body: "Requests already running get up to `--shutdown-grace-secs` (10 s)."
+- title: Write the last segment
+  body: "The source's consumer gets up to 10 s to hand over what it read, then marco writes the last change segment, after a checkpoint that's running, and exits. Every write it acknowledged, in the drain too, is in the snapshot."
+```
+
+The drain is the time a load balancer takes to stop sending new connections. Kubernetes takes a
+terminating pod out of its Service's endpoints at once, but each node's proxy hears of it a moment
+later, and a load balancer that probes `/readyz` waits for its failure threshold. A client that holds
+connections through a Service, which pins each connection to one pod, moves off them: an HTTP/1
+client after its next answer in the drain, an HTTP/2 or gRPC client at the GOAWAY. So a client that
+follows them loses no request to a restart, as long as what's in flight finishes within the grace.
+No `preStop` sleep is needed; one adds to the time.
+
+Set the pod's `terminationGracePeriodSeconds` to the drain, plus the grace, plus 10 s for the
+consumer, plus the longest checkpoint `marco_checkpoint_seconds` shows (the last segment waits for a
+running checkpoint): about 90 s with the defaults on the whole network, where a checkpoint takes 25 to
+40 s. Kubernetes' default of 30 s is too short. At its end comes SIGKILL, and the writes since the
+last segment are gone, save what a source replays ([kill -9](durability.md#kill-9)).
 
 ## Metrics
 

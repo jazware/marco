@@ -2,7 +2,7 @@
 name = "marco-ops"
 version.workspace = true
 edition = "2021"
-description = "marco's ops endpoint: Prometheus /metrics, pprof CPU and heap profiles on demand, the tracing switch, OTLP export"
+description = "marco's ops endpoint: Prometheus /metrics, pprof CPU and heap profiles on demand, the tracing switch, OTLP export, and a clean stop for a process's listeners"
 license = "MIT"
 publish = false
 
@@ -18,7 +18,7 @@ marco-core = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 axum = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
 prometheus = { workspace = true, features = ["process"] }
 tracing = { workspace = true }
 opentelemetry = { workspace = true }

@@ -1,7 +1,9 @@
 //! marco's server. The API listener serves marco.v1.Graph and the docs at
 //! /docs. The admin listener (loopback by default) serves Graph too,
 //! marco.v1.Admin, the ops routes (/metrics, /debug/pprof/*, /debug/tracing),
-//! the console at /admin and the docs.
+//! the console at /admin and the docs. Every listener stops through
+//! [`App::drain`]: `/readyz` goes 503 first, then the listeners stop
+//! accepting and close their connections gracefully.
 
 pub mod admin_svc;
 pub mod app;
@@ -57,8 +59,12 @@ fn connect(app: &Arc<App>, admin: bool) -> axum::Router {
 }
 
 /// 200 once every expected source has caught up since start and reads
-/// aren't failing across the disk, else 503 and why.
+/// aren't failing across the disk, else 503 and why. 503 for good once the
+/// drain has begun, while the listeners still serve.
 async fn readyz(axum::extract::State(app): axum::extract::State<Arc<App>>) -> (http::StatusCode, String) {
+    if app.drain.draining() {
+        return (http::StatusCode::SERVICE_UNAVAILABLE, "shutting down\n".into());
+    }
     match app.ready_status() {
         (true, _) => (http::StatusCode::OK, "ready\n".into()),
         (false, why) => (http::StatusCode::SERVICE_UNAVAILABLE, format!("{why}\n")),
@@ -99,8 +105,14 @@ pub async fn serve_ops(app: &Arc<App>) -> Result<Option<SocketAddr>> {
         Arc::new(move || app.graph().refresh_gauges()) as marco_ops::Refresh
     };
     let r = marco_ops::read_router(Some(refresh)).route("/healthz", axum::routing::get(|| async { "ok\n" }));
-    tokio::spawn(async move { axum::serve(l, r).await });
+    let r = closing(app, r);
+    app.drain.spawn(axum::serve(l, r).with_graceful_shutdown(app.drain.stopped()));
     Ok(Some(local))
+}
+
+/// `r` with [`marco_ops::drain::close_http1`] on every route.
+fn closing(app: &Arc<App>, r: axum::Router) -> axum::Router {
+    r.layer(axum::middleware::from_fn_with_state(app.drain.clone(), marco_ops::drain::close_http1))
 }
 
 /// The server's runtime: `threads` workers (one per core by default),
@@ -119,7 +131,8 @@ pub fn runtime(threads: Option<usize>) -> std::io::Result<tokio::runtime::Runtim
         .build()
 }
 
-/// Binds both listeners and serves them on the current runtime.
+/// Binds both listeners and serves them on the current runtime, until
+/// [`App::drain`] stops them.
 pub async fn serve(app: Arc<App>, ui: Arc<ui::Ui>) -> Result<(SocketAddr, SocketAddr)> {
     metrics::init(VERSION, COMMIT);
     metrics::watch(&app);
@@ -130,19 +143,20 @@ pub async fn serve(app: Arc<App>, ui: Arc<ui::Ui>) -> Result<(SocketAddr, Socket
         .await
         .with_context(|| format!("bind --admin-listen {}", app.cfg.admin_listen))?;
     let (a1, a2) = (api.local_addr()?, admin.local_addr()?);
-    let r1 = api_router(&app).merge(ui::docs_routes(ui.clone(), false)).into_make_service_with_connect_info::<Peer>();
-    let r2 = admin_router(&app, ui.clone()).into_make_service_with_connect_info::<Peer>();
+    let api_routes = || closing(&app, api_router(&app).merge(ui::docs_routes(ui.clone(), false)));
+    let r1 = api_routes().into_make_service_with_connect_info::<Peer>();
+    let r2 = closing(&app, admin_router(&app, ui.clone())).into_make_service_with_connect_info::<Peer>();
     let from = &app.cfg.auth.proxy_protocol_from;
     let (api, admin) = (PeerListener::new(api, from.clone())?, PeerListener::new(admin, from.clone())?);
+    let d = &app.drain;
     if let Some(addr) = &app.cfg.api_listen_extra {
         let l = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("bind --listen-extra {addr}"))?;
         let extra = PeerListener::new(l, from.clone())?;
-        let r =
-            api_router(&app).merge(ui::docs_routes(ui.clone(), false)).into_make_service_with_connect_info::<Peer>();
-        tokio::spawn(async move { axum::serve(extra, r).await });
+        let r = api_routes().into_make_service_with_connect_info::<Peer>();
+        d.spawn(axum::serve(extra, r).with_graceful_shutdown(d.stopped()));
     }
-    tokio::spawn(async move { axum::serve(api, r1).await });
-    tokio::spawn(async move { axum::serve(admin, r2).await });
+    d.spawn(axum::serve(api, r1).with_graceful_shutdown(d.stopped()));
+    d.spawn(axum::serve(admin, r2).with_graceful_shutdown(d.stopped()));
     series::spawn(app);
     Ok((a1, a2))
 }

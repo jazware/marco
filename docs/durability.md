@@ -61,8 +61,9 @@ long.
 ```
 
 The first cursor a source ever sets, and the operator's `SetActorStatus`, don't wait for the
-timer: their segment is written before they answer. A clean stop (SIGTERM or Ctrl-C) gives the
-consumer up to 10 s to hand over what it read, then writes a last segment, so it loses nothing.
+timer: their segment is written before they answer. A clean stop (SIGTERM or Ctrl-C) drains the
+listeners first ([Stopping](operations.md#stopping)), then gives the consumer up to 10 s to hand over
+what it read and writes a last segment, so it loses nothing.
 
 > [!WARNING]
 > While segment writes fail (a full disk, I/O errors), marco keeps applying and acknowledging
