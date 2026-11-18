@@ -38,7 +38,7 @@ block. The design and its measurements are in [the design doc](seek.html).
 | Part | What it does | State |
 |---|---|---|
 | `seek builder` | Holds every actor's handle claim, display name and status. It follows Jetstream into them, verifies handles, and every 15 minutes builds the artifact and serves it at `/artifact/latest` (uploading it to a bucket when one is configured). On each new marco checkpoint it mirrors the checkpoint (files it already has by name and size are skipped, and each fetched file is checked against its section checksums) and runs PageRank on the mirror. | Its volume: the names state, the artifacts, the mirror and the ranks |
-| `seek serve` (a pod) | Downloads the newest artifact, checks it, maps it, replays Jetstream from the artifact's cursor into a small live overlay, and answers queries. A newer artifact is swapped in without a pause. | None: a scratch directory for the mapped artifacts |
+| `seek serve` (a pod) | Downloads the newest artifact, checks it, maps it, replays Jetstream from the artifact's cursor into a small live overlay, and answers queries. A newer artifact is swapped in without a pause. At start it serves the artifact it kept, once that checks ([Starting](#starting)). | Its volume: the artifact it serves, kept for the next start (the overlay is rebuilt from Jetstream) |
 | marco | Gives a pod each viewer's follow count, follows and mutuals (once per viewer, then cached) and filters every logged-in page by blocks both ways. It exports its checkpoint to the builder's mirror. | Its own |
 
 The artifact is one file: named sections, each 64-byte aligned with its own xxh3, behind a
@@ -127,8 +127,8 @@ Every flag has an env var. `seek serve`:
 |---|---|---|---|
 | `--listen` | `SEEK_LISTEN` | `0.0.0.0:7310` | The API: `bsky.Service`, `/healthz`, `/readyz` |
 | `--ops-listen` | `SEEK_OPS_LISTEN` | `127.0.0.1:7311` | `/metrics`, `/debug/pprof/{profile,heap}`, `/debug/tracing`. Bind it privately |
-| `--source` | `SEEK_SOURCE` | | The builder's `http(s)://…/artifact/latest`, `s3://bucket/prefix`, or a file or directory |
-| `--data` | `SEEK_DATA` | `/var/lib/seek` | Where the mapped artifacts live: two at a swap. Never the source's directory |
+| `--source` | `SEEK_SOURCE` | | The builder's `http(s)://…/artifact/latest`, `s3://bucket/prefix`, or a file or directory (a file is named as the builder names it, `<version>.seek`) |
+| `--data` | `SEEK_DATA` | `/var/lib/seek` | The artifact served, kept across restarts, and the next one at a swap: room for two. Never the source's directory |
 | `--poll-seconds` | `SEEK_POLL_SECONDS` | 30 | Between source polls |
 | `--marco` | `SEEK_MARCO` | | marco's API listener |
 | `--marco-connections` | `SEEK_MARCO_CONNECTIONS` | 4 | h2 connections to marco, calls spread round-robin over them |
@@ -172,6 +172,25 @@ shutdown flags, and:
 | `--state-every` | `SEEK_STATE_EVERY` | 4 | Save the names state every this many cycles |
 | `--verify-per-cycle`, `--recheck-days` | `SEEK_VERIFY_PER_CYCLE`, `SEEK_RECHECK_DAYS` | 9000, 30 | Handles queued for verification a cycle, and how old a check gets before it's done again |
 
+## Starting
+
+A pod binds its listeners first, then serves the artifact its `--data` kept, if it has one:
+
+1. Downloads cut short (`*.part`) are deleted. So is every artifact when the directory was filled
+   from another `--source` (the file `source` there names the one it came from).
+2. The newest artifact left is checked as a download is: the header's and every section's xxh3, and
+   its meta must name the version in its file name. One that fails is deleted and the next newest
+   is tried; any older ones are deleted once one is served.
+3. It's mapped and Jetstream is replayed from its cursor, with the same rule as a download: a cursor
+   older than `--replay-window-hours`, or a replay that starts past it, and the pod refuses to serve
+   until a newer artifact comes.
+4. The poll starts with that version as its ETag, so the builder answers 304 until it has a newer
+   one, and a newer one swaps in as usual. The one it replaces is deleted once its last query ends.
+
+So a restart is ready once the check, the map and the Jetstream catch-up are done, without waiting
+for the builder. With nothing kept (the first start, or every kept artifact refused), the pod waits
+for the builder's artifact.
+
 ## Health
 
 `/healthz` answers while the process runs. A pod's `/readyz` is 200 once it serves, else 503 with
@@ -188,7 +207,8 @@ Ctrl-C, `/readyz` turns 503 while every listener keeps serving, queries included
 stop accepting, HTTP/2 connections (the AppView's) get a GOAWAY, and queries in flight get up to
 `--shutdown-grace-secs` (10 s). The process exits without waiting for a build or a state save in
 progress: each lands whole by rename or not at all, and the builder starts again from its last saved
-state. A pod whose artifact download the builder's stop cut short tries again at its next poll.
+state. A pod keeps the artifact it serves on its volume for its next start. One whose artifact
+download the builder's stop cut short tries again at its next poll.
 Kubernetes' default `terminationGracePeriodSeconds` of 30 s covers the defaults.
 
 ## Metrics

@@ -45,13 +45,18 @@ pub struct Gen {
     pub overlay: RwLock<Overlay>,
     path: PathBuf,
     bytes: u64,
+    /// Set once it's swapped out or refused: its file goes with it. The one served stays on disk
+    /// when the process stops, for the next start to serve.
+    discard: AtomicBool,
 }
 
 impl Drop for Gen {
     fn drop(&mut self) {
         self.index.artifact().release();
         MAPPED.sub(self.bytes as i64);
-        let _ = std::fs::remove_file(&self.path);
+        if self.discard.load(Ordering::Relaxed) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -321,6 +326,8 @@ pub struct Pod {
     /// The listeners' clean stop (`--shutdown-drain-secs`): not ready once it begins, while
     /// queries are still answered.
     pub drain: marco_ops::drain::Drain,
+    /// Artifacts the ingest task has taken from its channel and swapped in or refused.
+    handled: tokio::sync::watch::Sender<u64>,
 }
 
 impl Pod {
@@ -358,11 +365,17 @@ impl Pod {
             rekey: ArcSwapOption::empty(),
             dropped: Default::default(),
             drain: marco_ops::drain::Drain::new(),
+            handled: tokio::sync::watch::Sender::new(0),
         })
     }
 
     pub fn current(&self) -> Option<Arc<Gen>> {
         self.cur.load_full()
+    }
+
+    /// Counts the artifacts the ingest task has swapped in or refused.
+    pub fn handled(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.handled.subscribe()
     }
 
     /// (ready, why not): `/readyz`. Not ready for good once the drain begins.
@@ -409,7 +422,8 @@ impl Pod {
     }
 
     /// Opens the artifact at `path` unless it was built before `newer_than` (ms), which is read
-    /// from its meta before anything is verified or paged in. None: refused as older.
+    /// from its meta before anything is verified or paged in. None: refused as older. Its meta
+    /// must name `version`: the file is what the source or the disk said it was.
     fn open_gen(next: u64, path: PathBuf, version: String, newer_than: Option<i64>) -> Result<Option<Gen>> {
         let refuse = |e: anyhow::Error| {
             VERIFY_FAILURES.inc();
@@ -421,12 +435,18 @@ impl Pod {
             Ok(a) => a,
             Err(e) => return refuse(e),
         };
-        let created = art
-            .raw("meta")
-            .ok()
-            .and_then(|m| serde_json::from_slice::<seek_core::index::Meta>(m).ok())
-            .map(|m| m.created_ms);
-        if let (Some(c), Some(cur)) = (created, newer_than) {
+        let meta = art.raw("meta").ok().and_then(|m| serde_json::from_slice::<seek_core::index::Meta>(m).ok());
+        if let Some(m) = &meta {
+            if m.version != version {
+                drop(art);
+                return refuse(anyhow::anyhow!(
+                    "{}: its meta says version {}, not {version}",
+                    path.display(),
+                    m.version
+                ));
+            }
+        }
+        if let (Some(c), Some(cur)) = (meta.map(|m| m.created_ms), newer_than) {
             if c <= cur {
                 REFUSED.with_label_values(&["older"]).inc();
                 drop(art);
@@ -445,7 +465,7 @@ impl Pod {
         let bytes = index.artifact().len() as u64;
         MAPPED.add(bytes as i64);
         let overlay = RwLock::new(Overlay::new(&index));
-        Ok(Some(Gen { id: next, version, index, overlay, path, bytes }))
+        Ok(Some(Gen { id: next, version, index, overlay, path, bytes, discard: AtomicBool::new(false) }))
     }
 
     /// Serves `g`; the generation it replaces goes on a blocking thread once its last query ends,
@@ -460,6 +480,7 @@ impl Pod {
         ARTIFACT_ACTORS.set(m.actors as i64);
         tracing::info!(version = %g.version, actors = m.actors, cursor_us = m.cursor_us, "serving artifact");
         if let Some(old) = self.cur.swap(Some(Arc::new(g))) {
+            old.discard.store(true, Ordering::Relaxed);
             tokio::task::spawn_blocking(move || {
                 let t = Instant::now();
                 while Arc::strong_count(&old) > 1 && t.elapsed() < Duration::from_secs(60) {
@@ -849,78 +870,82 @@ impl Pod {
         loop {
             tokio::select! {
                 Some((path, version)) = art.recv() => {
-                    let t = Instant::now();
-                    let next = self.next_gen.fetch_add(1, Ordering::Relaxed);
-                    let newer_than = self.current().map(|c| c.index.meta.created_ms);
-                    let v2 = version.clone();
-                    let opened = tokio::task::spawn_blocking(move || Pod::open_gen(next, path, v2, newer_than)).await;
-                    let g = match opened {
-                        Ok(Ok(Some(g))) => g,
-                        Ok(Ok(None)) => { tracing::warn!(version = %version, "artifact older than the one served: not swapped in"); continue }
-                        Ok(Err(e)) => { tracing::error!(error = %format!("{e:#}"), "artifact refused"); continue }
-                        Err(e) => { tracing::error!(error = %e, "artifact open panicked"); continue }
-                    };
-                    let cursor = g.index.meta.cursor_us;
-                    if let Some(s) = start.take() {
-                        if now_us().saturating_sub(cursor) > self.cfg.replay_window.as_micros() as u64 {
-                            tracing::error!(version = %g.version, cursor_us = cursor, "artifact older than Jetstream's replay window: refusing to serve until a newer one");
-                            self.stale.store(true, Ordering::Relaxed);
-                        }
-                        ring_from = cursor;
-                        let _ = s.send(cursor);
-                    } else {
-                        let reason = if cursor < ring_from {
-                            Some("uncovered")
-                        } else if gap_until.is_some_and(|gu| cursor < gu) {
-                            Some("gap")
-                        } else {
-                            None
+                    'art: {
+                        let t = Instant::now();
+                        let next = self.next_gen.fetch_add(1, Ordering::Relaxed);
+                        let newer_than = self.current().map(|c| c.index.meta.created_ms);
+                        let v2 = version.clone();
+                        let opened = tokio::task::spawn_blocking(move || Pod::open_gen(next, path, v2, newer_than)).await;
+                        let g = match opened {
+                            Ok(Ok(Some(g))) => g,
+                            Ok(Ok(None)) => { tracing::warn!(version = %version, "artifact older than the one served: not swapped in"); break 'art }
+                            Ok(Err(e)) => { tracing::error!(error = %format!("{e:#}"), "artifact refused"); break 'art }
+                            Err(e) => { tracing::error!(error = %e, "artifact open panicked"); break 'art }
                         };
-                        if let Some(r) = reason {
-                            REFUSED.with_label_values(&[r]).inc();
-                            tracing::warn!(version = %g.version, cursor_us = cursor, ring_from, reason = r, "artifact not swapped in");
-                            // its unmap and unlink go on a blocking thread, as a swapped-out one's do
-                            tokio::task::spawn_blocking(move || drop(g));
-                            continue;
-                        }
-                        // the ring holds what happened since; replay what the artifact doesn't have
-                        let mut ov = g.overlay.write();
-                        let mut n = 0;
-                        for (at, c) in ring.iter() {
-                            if *at > cursor {
-                                apply(&g.index, &mut ov, c);
-                                n += 1;
+                        let cursor = g.index.meta.cursor_us;
+                        if let Some(s) = start.take() {
+                            if now_us().saturating_sub(cursor) > self.cfg.replay_window.as_micros() as u64 {
+                                tracing::error!(version = %g.version, cursor_us = cursor, "artifact older than Jetstream's replay window: refusing to serve until a newer one");
+                                self.stale.store(true, Ordering::Relaxed);
                             }
+                            ring_from = cursor;
+                            let _ = s.send(cursor);
+                        } else {
+                            let reason = if cursor < ring_from {
+                                Some("uncovered")
+                            } else if gap_until.is_some_and(|gu| cursor < gu) {
+                                Some("gap")
+                            } else {
+                                None
+                            };
+                            if let Some(r) = reason {
+                                REFUSED.with_label_values(&[r]).inc();
+                                tracing::warn!(version = %g.version, cursor_us = cursor, ring_from, reason = r, "artifact not swapped in");
+                                // its unmap and unlink go on a blocking thread, as a swapped-out one's do
+                                g.discard.store(true, Ordering::Relaxed);
+                                tokio::task::spawn_blocking(move || drop(g));
+                                break 'art;
+                            }
+                            // the ring holds what happened since; replay what the artifact doesn't have
+                            let mut ov = g.overlay.write();
+                            let mut n = 0;
+                            for (at, c) in ring.iter() {
+                                if *at > cursor {
+                                    apply(&g.index, &mut ov, c);
+                                    n += 1;
+                                }
+                            }
+                            ov.cursor_us = ov.cursor_us.max(ring.back().map_or(0, |r| r.0));
+                            drop(ov);
+                            SWAP_REPLAYED.set(n);
+                            gap_until = None;
+                            self.stale.store(false, Ordering::Relaxed);
                         }
-                        ov.cursor_us = ov.cursor_us.max(ring.back().map_or(0, |r| r.0));
-                        drop(ov);
-                        SWAP_REPLAYED.set(n);
-                        gap_until = None;
-                        self.stale.store(false, Ordering::Relaxed);
-                    }
-                    // the viewer cache's entries move onto the new ids: a sweep after the swap, and
-                    // any query that gets to one first
-                    let (g, rk) = match (self.current(), self.marco.is_some()) {
-                        (Some(old), true) => {
-                            let (g, rk) = tokio::task::spawn_blocking(move || {
-                                let rk = Rekey::new(&old, &g);
-                                (g, rk)
-                            })
-                            .await
-                            .expect("rekey panicked");
-                            let rk = Arc::new(rk);
-                            self.rekey.store(Some(rk.clone()));
-                            (g, Some(rk))
+                        // the viewer cache's entries move onto the new ids: a sweep after the swap, and
+                        // any query that gets to one first
+                        let (g, rk) = match (self.current(), self.marco.is_some()) {
+                            (Some(old), true) => {
+                                let (g, rk) = tokio::task::spawn_blocking(move || {
+                                    let rk = Rekey::new(&old, &g);
+                                    (g, rk)
+                                })
+                                .await
+                                .expect("rekey panicked");
+                                let rk = Arc::new(rk);
+                                self.rekey.store(Some(rk.clone()));
+                                (g, Some(rk))
+                            }
+                            _ => (g, None),
+                        };
+                        self.publish_gen(g);
+                        if let Some(rk) = rk {
+                            tokio::spawn(self.clone().sweep(rk));
                         }
-                        _ => (g, None),
-                    };
-                    self.publish_gen(g);
-                    if let Some(rk) = rk {
-                        tokio::spawn(self.clone().sweep(rk));
+                        SWAPS.inc();
+                        SWAP_SECONDS.with(&[]).since(t);
+                        self.set_state();
                     }
-                    SWAPS.inc();
-                    SWAP_SECONDS.with(&[]).since(t);
-                    self.set_state();
+                    self.handled.send_modify(|n| *n += 1);
                 }
                 Some(ev) = js.recv() => {
                     last_event = Instant::now();
@@ -1027,6 +1052,30 @@ impl Pod {
             }
         }
     }
+}
+
+/// Serves the newest of `found` ([`crate::store::on_disk`]) that opens and checks, as the pod's
+/// first artifact: the ingest task takes it as it takes a download, staleness rules included. The
+/// others are deleted. Returns the version served, for the poll's ETag.
+pub async fn resume(pod: &Pod, art: &mpsc::Sender<(PathBuf, String)>, found: Vec<(PathBuf, String)>) -> Option<String> {
+    let mut handled = pod.handled();
+    let mut it = found.into_iter();
+    let mut served = None;
+    for (path, version) in it.by_ref() {
+        tracing::info!(version = %version, "artifact kept from the last run: checking it");
+        let n = *handled.borrow_and_update();
+        if art.send((path, version.clone())).await.is_err() || handled.wait_for(|h| *h > n).await.is_err() {
+            return None;
+        }
+        if pod.current().is_some_and(|g| g.version == version) {
+            served = Some(version);
+            break;
+        }
+    }
+    for (p, _) in it {
+        let _ = std::fs::remove_file(p);
+    }
+    served
 }
 
 /// Applies one change; a panic (a bug) skips the change instead of taking the pod down.

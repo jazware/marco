@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
@@ -133,6 +133,64 @@ pub fn safe_version(v: &str) -> Result<String> {
         bail!("artifact version {v:?} isn't a plain name");
     }
     Ok(v.to_string())
+}
+
+/// What a pod's `--data` kept from its last run, newest first: the artifacts it got from `source`.
+/// Downloads cut short (`.part`) are deleted, and so is every artifact when the directory was filled
+/// from another source (the file `source` names it).
+pub fn on_disk(data: &Path, source: &str) -> Result<Vec<(PathBuf, String)>> {
+    let mark = data.join("source");
+    let same = std::fs::read_to_string(&mark).is_ok_and(|s| s == source);
+    let mut found = Vec::new();
+    for e in std::fs::read_dir(data).with_context(|| format!("read {}", data.display()))?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let keep = match name.strip_suffix(".seek") {
+            Some(stem) => same && e.file_type().is_ok_and(|t| t.is_file()) && safe_version(stem).is_ok(),
+            None if name.ends_with(".part") => false,
+            None => continue,
+        };
+        if keep {
+            found.push((e.path(), name[..name.len() - 5].to_string()));
+        } else {
+            tracing::info!(file = %name, "deleting a leftover from the last run");
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    if !same {
+        let tmp = data.join("source.tmp");
+        std::fs::write(&tmp, source)?;
+        std::fs::rename(&tmp, &mark)?;
+    }
+    found.sort_by(|a, b| b.1.cmp(&a.1));
+    Ok(found)
+}
+
+/// Polls `src` every `every` and sends each artifact newer than `have` (the version served) to the
+/// pod's ingest task.
+pub async fn follow(
+    src: Source,
+    data: PathBuf,
+    mut have: Option<String>,
+    every: Duration,
+    art: tokio::sync::mpsc::Sender<(PathBuf, String)>,
+) {
+    loop {
+        match src.poll(have.as_deref(), &data).await {
+            Ok(Some(f)) => {
+                tracing::info!(version = %f.version, bytes = f.bytes, "artifact downloaded");
+                have = Some(f.version.clone());
+                if art.send((f.path, f.version)).await.is_err() {
+                    return;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                POLL_FAILURES.inc();
+                tracing::warn!(error = %format!("{e:#}"), "artifact poll failed");
+            }
+        }
+        tokio::time::sleep(every).await;
+    }
 }
 
 pub enum Source {

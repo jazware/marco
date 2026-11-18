@@ -394,14 +394,7 @@ async fn run(cli: Cli) -> Result<()> {
                     );
                 }
             }
-            // a restart's leftovers: nothing maps them now
-            for e in std::fs::read_dir(&data)?.flatten() {
-                if e.file_name().to_string_lossy().ends_with(".seek")
-                    || e.file_name().to_string_lossy().ends_with(".part")
-                {
-                    let _ = std::fs::remove_file(e.path());
-                }
-            }
+            let found = store::on_disk(&data, &source)?;
             let marco = marco
                 .map(|u| marco::Marco::new(&u, marco_connections, Duration::from_millis(marco_timeout_ms), max_follows))
                 .transpose()?;
@@ -431,25 +424,10 @@ async fn run(cli: Cli) -> Result<()> {
             let (queue, vrx) = verifier(&ingest);
             let (start_tx, start_rx) = tokio::sync::oneshot::channel();
             let ingest_task = tokio::spawn(pod.clone().run_ingest(art_rx, js_rx, vrx, queue, start_tx));
+            let p = pod.clone();
             tokio::spawn(async move {
-                let mut have: Option<String> = None;
-                loop {
-                    match src.poll(have.as_deref(), &data).await {
-                        Ok(Some(f)) => {
-                            tracing::info!(version = %f.version, bytes = f.bytes, "artifact downloaded");
-                            have = Some(f.version.clone());
-                            if art_tx.send((f.path, f.version)).await.is_err() {
-                                return;
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            metrics::POLL_FAILURES.inc();
-                            tracing::warn!(error = %format!("{e:#}"), "artifact poll failed");
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_secs(poll_seconds)).await;
-                }
+                let have = serve::resume(&p, &art_tx, found).await;
+                store::follow(src, data, have, Duration::from_secs(poll_seconds), art_tx).await
             });
             let js = ingest.jetstream.clone();
             tokio::spawn(async move {
