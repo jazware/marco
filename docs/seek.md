@@ -142,7 +142,7 @@ Every flag has an env var. `seek serve`:
 | `--replay-window-hours` | `SEEK_REPLAY_WINDOW_HOURS` | 24 | Jetstream's replay window |
 | `--max-lag-seconds` | `SEEK_MAX_LAG_SECONDS` | 300 | Not ready while Jetstream is further behind, or silent this long |
 | `--follow-events` | `SEEK_FOLLOW_EVENTS` | true | Read follow records to drop a viewer's entry when they follow or unfollow |
-| `--jetstream` | `SEEK_JETSTREAM` | `wss://jetstream2.us-east.bsky.network` | |
+| `--jetstream` | `SEEK_JETSTREAM` | `wss://jetstream2.us-east.bsky.network` | Several comma-separated: a socket that goes quiet while behind, with nothing read past the cursor, redials the next one. Once every instance was stuck there, the cursor steps past (1 s, doubling) and the replay's gap is reported |
 | `--plc`, `--plc-rate` | `SEEK_PLC`, `SEEK_PLC_RATE` | `https://plc.directory`, 10/s | DID documents for handle verification |
 | `--verify-rate`, `--verify-workers` | `SEEK_VERIFY_RATE`, `SEEK_VERIFY_WORKERS` | 10/s, 8 | DNS TXT and HTTPS well-known lookups, to hosts the handles name |
 | `--no-verify` | `SEEK_NO_VERIFY` | off | A handle change leaves the actor with no handle until the next artifact |
@@ -247,7 +247,7 @@ thread, as marco's op histograms are.
 | `seek_overlay_actors`, `seek_overlay_keys`, `seek_overlay_bytes`, `seek_ring_entries` | | The live overlay, and the changes kept for the next swap |
 | `seek_jetstream_events_total` | `kind`: `profile`, `identity`, `account`, `follow`, `skipped` | |
 | `seek_jetstream_lag_seconds`, `seek_jetstream_cursor_timestamp_seconds` | | |
-| `seek_jetstream_reconnects_total`, `seek_jetstream_decode_errors_total`, `seek_jetstream_gaps_total` | | |
+| `seek_jetstream_reconnects_total`, `seek_jetstream_decode_errors_total`, `seek_jetstream_gaps_total`, `seek_jetstream_stuck_total` | | |
 | `seek_ingest_panics_total` | | Changes that panicked and were skipped (a bug) |
 | `seek_verify_queue` | | Handles waiting |
 | `seek_verify_checks_total` | `result`: `ok`, `mismatch`, `error`, `rate_limited`; `method`: `did_doc`, `dns`, `well_known` | |

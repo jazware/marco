@@ -178,6 +178,10 @@ pub static JS_GAPS: LazyLock<IntCounter> = counter!(
     "seek_jetstream_gaps_total",
     "Replays whose first event came after the cursor asked for: the cursor was past Jetstream's window"
 );
+pub static JS_STUCK: LazyLock<IntCounter> = counter!(
+    "seek_jetstream_stuck_total",
+    "Sockets that went quiet while behind with nothing read past the cursor: the next dial moves on"
+);
 
 // ---- handle verification
 pub static VERIFY_QUEUE: LazyLock<IntGauge> = gauge!("seek_verify_queue", "Handles waiting to be verified");
@@ -321,6 +325,7 @@ pub fn init() {
     LazyLock::force(&JS_RECONNECTS);
     LazyLock::force(&JS_DECODE);
     LazyLock::force(&JS_GAPS);
+    LazyLock::force(&JS_STUCK);
     LazyLock::force(&VERIFY_QUEUE);
     LazyLock::force(&LAST_SUCCESS);
     LazyLock::force(&PR_PASSES);

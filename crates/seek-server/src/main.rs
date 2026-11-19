@@ -69,7 +69,8 @@ impl Common {
 
 #[derive(clap::Args)]
 struct Ingest {
-    /// Jetstream's base URL.
+    /// Jetstream's base URL, or several comma-separated: a cursor one instance is stuck at goes to
+    /// the next.
     #[arg(long, env = "SEEK_JETSTREAM", default_value = "wss://jetstream2.us-east.bsky.network")]
     jetstream: String,
     /// PLC directory for handle verification.
