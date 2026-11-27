@@ -558,6 +558,43 @@ async fn listitems_survive_kills_on_both_sides_of_a_checkpoint() {
     assert_eq!(got.len(), want.len());
 }
 
+/// An owner of more list items than the by-subject threshold (4096), in a
+/// checkpoint, then the owner's deletion: a restart that replays the deletion
+/// from its segment, over the paged lists, ends where a live run does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_big_list_owners_deletion_replays_as_it_applied() {
+    let t0 = marco_server::app::now_ms() * 1000 - 86_400_000_000;
+    let o = did(1);
+    let n = 5000;
+    let mut s: Vec<W> = (0..n)
+        .map(|i| {
+            W::Ops(vec![Op::Add {
+                uri: uri(&o, LISTITEM, &tid(70_000_000 + i as u64, 1)),
+                subject: did(20 + (i % 40) as u32),
+                list: Some(list_uri(&o, (i % 2) as u32)),
+                time_us: t0 + i as i64,
+            }])
+        })
+        .collect();
+    s.push(W::Status(o.clone(), Some(Status::Deleted), t0 + n as i64 + 1_000));
+    let want = uninterrupted(&s).await;
+    let (_d, snap) = snapshot();
+    let app = App::open(cfg(&snap)).unwrap();
+    feed(&app, &s, 0, n).await;
+    app.checkpoint().await.unwrap();
+    feed(&app, &s, n, s.len()).await;
+    app.flush().await.unwrap();
+    drop(app);
+    let app = App::open(cfg(&snap)).unwrap();
+    assert_eq!(resume(&app), s.len());
+    assert_eq!(dump(&app.graph()), want);
+    let g = app.graph();
+    assert_eq!(g.read(|cx| g.counts(cx, 3, &o)).unwrap(), (0, 0), "no item is left");
+    for l in 0..2 {
+        assert_eq!(g.read(|cx| g.counts(cx, 2, &list_uri(&o, l))).unwrap(), (0, 0), "list {l} is empty");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_listitem_delete_before_its_create_holds_through_a_restart() {
     let (_d, snap) = snapshot();
