@@ -1260,6 +1260,101 @@ fn an_owners_deletion_costs_a_few_lookups_per_item_at_any_list_size() {
     }
 }
 
+/// Lists as `recs` ((owner, rkey) to (list, member)) has them: totals,
+/// owners, lists and members.
+fn check_lists(g: &Graph, recs: &BTreeMap<(u32, u64), (u32, u32)>, owners: u32, lists: u32, members: u32, at: &str) {
+    let list_members: BTreeSet<(u32, u32, u32)> = recs.iter().map(|(k, v)| (k.0, v.0, v.1)).collect();
+    let owner_lists: BTreeSet<(u32, u32)> = recs.iter().map(|(k, v)| (k.0, v.0)).collect();
+    let n = recs.len() as u64;
+    assert_eq!(g.records(LIST), (n, list_members.len() as u64), "{at}: list totals");
+    assert_eq!(g.records(LIST_OWNER), (n, owner_lists.len() as u64), "{at}: owner totals");
+    for o in 0..owners {
+        let items = recs.keys().filter(|k| k.0 == o).count() as u64;
+        assert_eq!(g.read(|cx| g.counts(cx, LIST_OWNER, &did(o))).unwrap(), (items, 0), "{at}: owner {o}");
+        let oid = g.id_of(&did(o)).unwrap();
+        let distinct = owner_lists.iter().filter(|x| x.0 == o).count() as u64;
+        assert_eq!(g.read(|cx| g.out_distinct(cx, LIST_OWNER, oid)).unwrap(), distinct, "{at}: owner {o}'s lists");
+        for l in 0..lists {
+            let lu = list_uri(&did(o), l);
+            let items = recs.iter().filter(|(k, v)| k.0 == o && v.0 == l).count() as u64;
+            assert_eq!(g.read(|cx| g.counts(cx, LIST, &lu)).unwrap(), (items, 0), "{at}: list {o}/{l}");
+            let owned = u64::from(items > 0);
+            assert_eq!(g.read(|cx| g.counts(cx, LIST_OWNER, &lu)).unwrap(), (0, owned), "{at}: list {o}/{l}'s owner");
+            let lid = g.id_of(&lu).unwrap();
+            let on: BTreeSet<u32> = list_members.iter().filter(|x| x.0 == o && x.1 == l).map(|x| x.2).collect();
+            assert_eq!(g.read(|cx| g.out_distinct(cx, LIST, lid)).unwrap(), on.len() as u64, "{at}: list {o}/{l}");
+            for m in 10..10 + members {
+                let has = g.read(|cx| g.has(cx, LIST, &lu, &did(m))).unwrap().is_some();
+                assert_eq!(has, on.contains(&m), "{at}: list {o}/{l} has {m}");
+            }
+        }
+    }
+    for m in 10..10 + members {
+        let lists_on = list_members.iter().filter(|x| x.2 == m).count() as u64;
+        assert_eq!(g.read(|cx| g.counts(cx, LIST, &did(m))).unwrap(), (0, lists_on), "{at}: member {m}");
+    }
+}
+
+/// An owner's deletion over paged lists (past WHOLE, with by-subject blocks)
+/// whose members repeat within a list and across lists, after deletes and
+/// adds over the base: the graph reads as a plain model of the records says,
+/// with lists merged inside the write and without, and again from a snapshot.
+#[test]
+fn an_owners_deletion_over_paged_lists_matches_a_model() {
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut rnd = |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let (owners, lists, members, base) = (3u32, 2u32, 40u32, 600u64);
+    let doomed = 1;
+    for compact_min in [0, 4] {
+        let mut recs: BTreeMap<(u32, u64), (u32, u32)> = BTreeMap::new();
+        let mut g = graph();
+        g.set_subj_index(8);
+        let add = |g: &mut Graph, o: u32, k: u64, (l, m): (u32, u32), t: i64| {
+            g.add_rec(&listitem(&did(o), &tid(k)), &did(m), Some(&list_uri(&did(o), l)), t).unwrap()
+        };
+        for o in 0..owners {
+            for k in 0..base {
+                let v = (rnd(lists.into()) as u32, 10 + rnd(members.into()) as u32);
+                assert_eq!(add(&mut g, o, k, v, 0), Added::Added);
+                recs.insert((o, k), v);
+            }
+        }
+        let mut g = reopen(&g);
+        g.compact_min = compact_min;
+        check_lists(&g, &recs, owners, lists, members, "base");
+        for step in 0..400 {
+            let o = rnd(owners.into()) as u32;
+            if step % 3 == 0 {
+                // a new rkey, each once
+                let k = base + step;
+                let v = (rnd(lists.into()) as u32, 10 + rnd(members.into()) as u32);
+                assert_eq!(add(&mut g, o, k, v, 20), Added::Added);
+                recs.insert((o, k), v);
+            } else {
+                let k = rnd(base);
+                let got = g.delete_at(&listitem(&did(o), &tid(k)), 10).unwrap();
+                let want = recs.remove(&(o, k)).map_or(Removed::NotFound, |(_, m)| removed(&did(m)));
+                assert_eq!(got, want, "compact_min {compact_min} step {step}");
+            }
+        }
+        let at = format!("compact_min {compact_min}");
+        check_lists(&g, &recs, owners, lists, members, &format!("{at}, deltas"));
+        let n = recs.keys().filter(|k| k.0 == doomed).count() as u64;
+        assert_eq!(g.set_status(&did(doomed), Some(Status::Deleted), 30).unwrap(), n);
+        recs.retain(|k, _| k.0 != doomed);
+        // shown again, so the reads count what the deletion left
+        g.set_status(&did(doomed), None, 30).unwrap();
+        check_lists(&g, &recs, owners, lists, members, &format!("{at}, owner deleted"));
+        let g = reopen(&g);
+        check_lists(&g, &recs, owners, lists, members, &format!("{at}, reopened"));
+    }
+}
+
 /// The archive's worst list is 640k records for 119 members: a distinct page
 /// and Has stay well under a second on it.
 #[test]
