@@ -893,12 +893,23 @@ impl<'g> SplitOut<'g> {
     }
 
     /// Positions holding `subject`, newest first, until `f` returns false.
+    ///
+    /// Reads the by-subject blocks as the walk reaches them: a delete asks
+    /// this per record whether another names the same subject, and every item
+    /// of a list names that list, so needing the whole range first would make
+    /// an account's deletion quadratic in its lists' sizes. The first missing
+    /// block names the rest of the range, so a cold walk is still one round.
     pub fn for_subject(&self, cx: &ReadCx<'g>, subject: u32, mut f: impl FnMut(usize) -> bool) -> R<()> {
         if self.nbs > 0 {
             let js = self.by_range(subject);
-            self.by_subject().need(cx, js.clone())?;
-            for j in js.rev() {
-                let (pos, hits) = self.by_find(cx, j, subject)?;
+            for j in js.clone().rev() {
+                let (pos, hits) = match self.by_find(cx, j, subject) {
+                    Ok(found) => found,
+                    Err(Pending) => {
+                        let _ = self.by_subject().need(cx, js.start..j);
+                        return Err(Pending);
+                    }
+                };
                 for i in hits.rev() {
                     if !f(u32_at(pos, 4 * i) as usize) {
                         return Ok(());

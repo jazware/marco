@@ -1236,6 +1236,30 @@ fn replace_keeps_counts_and_distinct_members_right() {
     }
 }
 
+/// An account's deletion removes its list items one by one, and each asks
+/// whether another of the owner's items still names that list. The walk that
+/// answers stops at the first live one, so it must read only the blocks it
+/// reaches: reading the list's whole range first makes the deletion quadratic.
+#[test]
+fn an_owners_deletion_costs_a_few_lookups_per_item_at_any_list_size() {
+    for n in [4096u32, 32_768] {
+        let o = did(1);
+        let l = list_uri(&o, 1);
+        let mut g = graph();
+        for k in 0..n {
+            g.add_rec(&listitem(&o, &tid(k as u64)), &did(10 + k), Some(&l), 0).unwrap();
+        }
+        let mut g = reopen(&g);
+        let lookups = |g: &Graph| g.engine().stats().lookups.iter().flatten().sum::<u64>();
+        let before = lookups(&g);
+        assert_eq!(g.set_status(&o, Some(Status::Deleted), 1).unwrap(), n as u64);
+        let per_item = (lookups(&g) - before) as f64 / n as f64;
+        assert!(per_item <= 16.0, "{n} items: {per_item:.1} lookups per item");
+        assert_eq!(g.read(|cx| g.counts(cx, LIST, &l)).unwrap(), (0, 0));
+        assert_eq!(g.read(|cx| g.counts(cx, LIST, &did(10))).unwrap(), (0, 0));
+    }
+}
+
 /// The archive's worst list is 640k records for 119 members: a distinct page
 /// and Has stay well under a second on it.
 #[test]
