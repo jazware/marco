@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use marco_core::read::Engine;
+use marco_core::read::{Engine, Found, Source};
 use marco_core::store::engine::Config as EngineConfig;
 use marco_core::store::io::{default_device, Fault, Times};
 use marco_core::store::{shard_file, Storage};
@@ -223,6 +223,31 @@ fn rss_anon() -> Option<u64> {
 /// Heap outside the budget: the graph's copies and their deltas, the
 /// runtime, the test's own dumps.
 const OUTSIDE: u64 = 96 * MIB;
+
+/// A checkpoint's and its compactions' reads count under source="job", so
+/// the hit ratio of requests and writes (MarcoStoreHitRatioLow's) leaves out
+/// a compaction missing on pages nobody serves.
+#[test]
+fn checkpoints_and_compactions_count_their_lookups_as_jobs() {
+    let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = marco_server::runtime(Some(2)).unwrap();
+    rt.block_on(async {
+        let (_d, snap) = snapshot_of(BIG);
+        let app = App::open(cfg(&snap, engine(8 * MIB), true)).unwrap();
+        let sum = |s: Source| app.engine.stats().lookups[s as usize].iter().flatten().sum::<u64>();
+        let misses =
+            |s: Source| app.engine.stats().lookups[s as usize].iter().map(|f| f[Found::Miss as usize]).sum::<u64>();
+        let (writes, jobs, job_misses) = (sum(Source::Write), sum(Source::Job), misses(Source::Job));
+        feed_of(&app, 0, BIG).await;
+        assert!(sum(Source::Write) > writes, "a write's reads count as write");
+        app.checkpoint().await.unwrap();
+        compacted(&app).await;
+        assert!(app.durability.lock().unwrap().compactions > 0);
+        assert!(sum(Source::Job) > jobs && misses(Source::Job) > job_misses, "{:?}", app.engine.stats());
+        assert_eq!(sum(Source::Request), 0, "no request ran");
+        app.shutdown().await.unwrap();
+    });
+}
 
 #[test]
 fn store_memory_and_rss_stay_under_the_budget_through_checkpoints() {

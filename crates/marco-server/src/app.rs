@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use arc_swap::{ArcSwap, Guard};
 use marco_core::did::classify;
-use marco_core::read::{Engine, Hold};
+use marco_core::read::{Engine, Hold, Source};
 use marco_core::relation::parse_uri;
 use marco_core::store::Storage;
 use marco_core::{segment, Added, Graph, Rec, RelationshipSet, Removed};
@@ -414,7 +414,7 @@ pub fn apply_planned(g: &mut Graph, mut t: Option<&mut Graph>, recs: &[Rec]) -> 
             ops > PLAN_OPS
         });
         let end = at + end.map_or(recs.len() - at, |e| e.max(1));
-        let mut hold = Hold::new();
+        let mut hold = Hold::new().source(Source::Write);
         g.plan(&recs[at..end].iter().collect::<Vec<_>>(), &mut hold);
         for r in &recs[at..end] {
             apply_rec_noting(g, r, &mut storage);

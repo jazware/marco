@@ -823,7 +823,7 @@ match app.engine.pass(&amp;mut Hold::none(), &amp;work) {           // on the to
 <table>
 <tr><th>Metric</th><th>Labels</th><th>Answers</th></tr>
 <tr><td><code>marco_store_bytes</code></td><td>part = budget, pinned_dir, pinned_index, pinned_heads, pinned_tables, cache_main, cache_small, retired, pinned_frames, free, borrowed, garbage</td><td>where the budget is</td></tr>
-<tr><td><code>marco_store_lookups_total</code></td><td>structure = out_small, out_subj, out_rkey, out_bysubj, in_small, in_blocks; result = hit, miss; queue = small, main</td><td>hit ratio by tier and structure</td></tr>
+<tr><td><code>marco_store_lookups_total</code></td><td>structure = out_small, out_subj, out_rkey, out_bysubj, in_small, in_blocks; result = hit, miss; queue = small, main, none; source = request, write, job</td><td>hit ratio by tier and structure; requests' and writes' alone for the serving one</td></tr>
 <tr><td><code>marco_rpc_seconds</code> (histogram)</td><td>rpc, path = fast, pool</td><td>latency; <code>path="fast"</code> is the hit-only set E9 compares</td></tr>
 <tr><td><code>marco_store_request_pages</code>, <code>marco_store_request_rounds</code> (histograms)</td><td>rpc</td><td>disk reads and rounds per request type; checks the bounds table</td></tr>
 <tr><td><code>marco_store_miss_pool_busy</code>, <code>marco_store_miss_pool_wait_seconds</code>, <code>marco_store_busy_total</code></td><td></td><td>the miss pool, and requests refused when it's full</td></tr>

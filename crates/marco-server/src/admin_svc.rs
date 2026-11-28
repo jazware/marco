@@ -33,18 +33,19 @@ fn stored(s: Stored) -> String {
 /// The Cache panel's numbers: the budget by part, lookups by structure,
 /// errors, and what checkpoints and compactions did.
 fn cache_pb(app: &App) -> Cache {
-    use marco_core::read::{Found, Structure};
+    use marco_core::read::{Found, Source, Structure};
     let b = crate::metrics::store_bytes(app);
     let st = app.engine.stats();
     let structures = Structure::ALL
         .iter()
         .filter(|&&s| s != Structure::Other)
         .map(|&s| {
-            let l = &st.lookups[s as usize];
+            // requests' and writes' lookups, as MarcoStoreHitRatioLow counts them
+            let l = [Source::Request, Source::Write].map(|src| st.lookups[src as usize][s as usize]);
             CacheStructure {
                 name: s.name().into(),
-                lookups: l.iter().sum(),
-                misses: l[Found::Miss as usize],
+                lookups: l.iter().flatten().sum(),
+                misses: l.iter().map(|f| f[Found::Miss as usize]).sum(),
                 ..Default::default()
             }
         })

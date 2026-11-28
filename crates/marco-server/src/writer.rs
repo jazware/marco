@@ -38,7 +38,7 @@ use anyhow::{anyhow, bail, Result};
 use marco_core::store::{remove_unlisted, Manifest};
 use marco_core::{segment, Compacted, Graph, Rec};
 
-use marco_core::read::Hold;
+use marco_core::read::{Hold, Source};
 
 use crate::app::{apply_planned, apply_rec, now_ms, open_replayed, App, Applied};
 
@@ -387,7 +387,7 @@ impl Writer {
         let mut g = self.spare.take().expect("the spare copy");
         let mut outs = Vec::with_capacity(applies.len());
         // the plan's pins last through both copies' applies
-        let mut hold = Hold::new();
+        let mut hold = Hold::new().source(Source::Write);
         {
             let gm = exclusive(&mut g);
             gm.quiet = false;

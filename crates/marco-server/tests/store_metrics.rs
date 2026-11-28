@@ -85,12 +85,13 @@ fn store_metrics_and_the_storm_rule() {
         assert!(sample(&m, "marco_store_bytes", r#"part="pinned_dir""#).unwrap() > 0.0, "{m}");
         assert!(sample(&m, "marco_store_bytes", r#"part="pinned_index""#).unwrap() > 0.0);
         assert!(sample(&m, "marco_store_bytes", r#"part="cache_small""#).unwrap() > 0.0);
-        let hits = sample(&m, "marco_store_lookups_total", r#"structure="out_small",result="hit",queue="small""#)
-            .unwrap()
-            + sample(&m, "marco_store_lookups_total", r#"structure="out_small",result="hit",queue="main""#).unwrap();
-        let misses =
-            sample(&m, "marco_store_lookups_total", r#"structure="out_small",result="miss",queue="none""#).unwrap();
+        let lookups = |labels: &str| sample(&m, "marco_store_lookups_total", labels).unwrap();
+        let hits = lookups(r#"structure="out_small",result="hit",queue="small",source="request""#)
+            + lookups(r#"structure="out_small",result="hit",queue="main",source="request""#);
+        let misses = lookups(r#"structure="out_small",result="miss",queue="none",source="request""#);
         assert!(hits > 0.0 && misses > 0.0, "out_small: {hits} hits, {misses} misses");
+        // every source's counters start at 0, so rate() sees a job's first scan
+        assert_eq!(lookups(r#"structure="out_small",result="miss",queue="none",source="job""#), 0.0);
         assert!(sample(&m, "marco_store_io_seconds_count", r#"queue="request""#).unwrap() > 0.0);
         assert_eq!(
             sample(&m, "marco_store_io_queue_wait_seconds_count", r#"queue="request""#),

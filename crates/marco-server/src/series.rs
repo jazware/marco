@@ -203,7 +203,7 @@ impl Ring {
                             Key { metric: "store_io_bytes", dir: label(m, "queue"), ..Default::default() },
                             rate(&i, ctrs[&i]),
                         )),
-                        "marco_store_lookups_total" => {
+                        "marco_store_lookups_total" if label(m, "source") != "job" => {
                             let r = rate(&i, ctrs[&i]);
                             let e = lookups.entry(label(m, "structure")).or_default();
                             e.0 += r;

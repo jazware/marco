@@ -5,7 +5,7 @@ use std::sync::Arc;
 use connectrpc::{ConnectError, InboundStream, RequestContext, Response, ServiceRequest, ServiceResult};
 use futures::StreamExt;
 use marco_core::graph::VIA_MAX_LISTS;
-use marco_core::read::{Hold, ReadCx, StorageError, R};
+use marco_core::read::{Hold, ReadCx, Source, StorageError, R};
 use marco_core::relation::parse_uri;
 use marco_core::relationship::{Derive, Relationship as Rship, RelationshipSet};
 use marco_core::{
@@ -323,7 +323,8 @@ async fn run_with<T: Send + 'static>(
 ) -> Result<T, ConnectError> {
     let first = {
         let g = app.graph();
-        app.engine.pass(&mut Hold::none(), |cx| f(&g, cx))
+        let source = if job { Source::Job } else { Source::Request };
+        app.engine.pass(&mut Hold::none().source(source), |cx| f(&g, cx))
     };
     match first {
         Ok(t) => {

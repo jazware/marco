@@ -380,8 +380,8 @@ const STORE_FAMILIES: [(&str, &str, &[&str]); 15] = [
     ("marco_store_bytes", "Where the store's budget is, by part (bytes)", &["part"]),
     (
         "marco_store_lookups_total",
-        "Page lookups by structure, hit or miss, and the queue a hit was in",
-        &["structure", "result", "queue"],
+        "Page lookups by structure, hit or miss, the queue a hit was in, and who read (request, write, job)",
+        &["structure", "result", "queue", "source"],
     ),
     ("marco_store_io_seconds", "Device read latency per read call, by lane (request, background)", &["queue"]),
     ("marco_store_io_bytes_total", "Bytes read from the device, by lane", &["queue"]),
@@ -502,7 +502,7 @@ impl prometheus::core::Collector for StoreMetrics {
     }
 
     fn collect(&self) -> Vec<prometheus::proto::MetricFamily> {
-        use marco_core::read::{Found, Structure};
+        use marco_core::read::{Found, Source, Structure};
         use prometheus::proto::MetricType::{COUNTER, GAUGE, HISTOGRAM};
         let Some(app) = WATCHED.lock().unwrap().upgrade() else { return Vec::new() };
         let e = &app.engine;
@@ -516,19 +516,21 @@ impl prometheus::core::Collector for StoreMetrics {
         out.push(f);
 
         let mut f = family(1, COUNTER);
-        for s in Structure::ALL {
-            for h in Found::ALL {
-                let (result, queue) = match h {
-                    Found::Small => ("hit", "small"),
-                    Found::Main => ("hit", "main"),
-                    Found::Other => ("hit", "none"),
-                    Found::Miss => ("miss", "none"),
-                };
-                counter(
-                    &mut f,
-                    &[("structure", s.name()), ("result", result), ("queue", queue)],
-                    st.lookups[s as usize][h as usize],
-                );
+        for src in Source::ALL {
+            for s in Structure::ALL {
+                for h in Found::ALL {
+                    let (result, queue) = match h {
+                        Found::Small => ("hit", "small"),
+                        Found::Main => ("hit", "main"),
+                        Found::Other => ("hit", "none"),
+                        Found::Miss => ("miss", "none"),
+                    };
+                    counter(
+                        &mut f,
+                        &[("structure", s.name()), ("result", result), ("queue", queue), ("source", src.name())],
+                        st.lookups[src as usize][s as usize][h as usize],
+                    );
+                }
             }
         }
         out.push(f);

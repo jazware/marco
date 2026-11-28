@@ -40,7 +40,7 @@ use crate::format6::SetWriter6;
 use crate::inset::{self, InList, PagedIn};
 use crate::obs::{self, Applied, Op};
 use crate::outlog::{self, OutBytes, OutList, PagedOut};
-use crate::read::{Engine, Hold, ReadCx, StorageError, R};
+use crate::read::{Engine, Hold, ReadCx, Source, StorageError, R};
 use crate::relation::{parse_uri, RelId, Relations, Skip};
 use crate::rkey::{self, is_tid, key_of};
 use crate::segment::{Rec, Status};
@@ -1724,7 +1724,7 @@ impl Graph {
             Ok(t) => Ok(t),
             Err(m) => {
                 self.engine.set_plan_writes(true);
-                self.engine.resume_blocking(&mut Hold::new(), Some(m), |cx| f(self, cx))
+                self.engine.resume_blocking(&mut Hold::new().source(Source::Write), Some(m), |cx| f(self, cx))
             }
         };
         r.map_err(|e| anyhow::Error::new(e).context("a write's read failed"))

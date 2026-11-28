@@ -21,7 +21,7 @@ use anyhow::{bail, Context, Result};
 use rustc_hash::FxHashMap;
 
 use crate::read::{
-    BadPage, Found, Guard, Hold, LookupCounts, Misses, PageSet, ReadCx, ReadStats, StorageError, UsedBytes, R,
+    BadPage, Found, Guard, Hold, LookupCounts, Misses, PageSet, ReadCx, ReadStats, Source, StorageError, UsedBytes, R,
 };
 use crate::snapshot::{sums_section, PagedFooter, SectionKind, TRAILER};
 use crate::store::cache::{Cache, CacheBytes, Entry, FileTable, GROUP, NO_FRAME};
@@ -421,7 +421,7 @@ struct Stripe {
     passes: AtomicU64,
     pages: AtomicU64,
     misses: AtomicU64,
-    by: [[AtomicU64; 4]; 7],
+    by: [[[AtomicU64; 4]; 7]; 3],
     used: [AtomicU64; 7],
 }
 
@@ -507,9 +507,9 @@ pub struct EngineStats {
     pub write_through_skipped: u64,
     /// Pages read past the cache into a job's own memory ([`Hold::past`]).
     pub past_pages: u64,
-    /// Lookups by structure and how they came out, `[structure][found]`
-    /// ([`Structure`], [`Found`]).
-    pub lookups: [[u64; 4]; 7],
+    /// Lookups by who read, structure and how they came out,
+    /// `[source][structure][found]` ([`Source`], [`Structure`], [`Found`]).
+    pub lookups: [[[u64; 4]; 7]; 3],
     /// Bytes requests' clean passes decoded, by structure
     /// ([`ReadCx::bytes_used`]), estimated from one pass in [`USED_SAMPLE`].
     pub bytes_used: UsedBytes,
@@ -908,12 +908,12 @@ impl Engine {
         }
     }
 
-    fn count(&self, st: ReadStats, by: &LookupCounts) {
+    fn count(&self, source: Source, st: ReadStats, by: &LookupCounts) {
         let s = &self.inner.counters.stripes[stripe()];
         s.passes.fetch_add(1, Relaxed);
         s.pages.fetch_add(st.pages as u64, Relaxed);
         s.misses.fetch_add(st.misses as u64, Relaxed);
-        for (a, b) in s.by.iter().zip(by) {
+        for (a, b) in s.by[source as usize].iter().zip(by) {
             for (x, &n) in a.iter().zip(b) {
                 if n > 0 {
                     x.fetch_add(n as u64, Relaxed);
@@ -940,7 +940,7 @@ impl Engine {
             let sampled = hold.count_used && sample_used();
             let cx = ReadCx::with(self, &guard, hold.keep, hold.quiet, &hold.pins, hold.private.as_deref(), sampled);
             let r = f(&cx);
-            self.count(cx.stats(), &cx.lookups());
+            self.count(hold.source, cx.stats(), &cx.lookups());
             if cx.clean() {
                 if let Ok(t) = r {
                     if sampled {
@@ -1678,7 +1678,7 @@ impl Engine {
         s.write_through_skipped = c.write_through_skipped.load(Relaxed);
         s.past_pages = c.past_pages.load(Relaxed);
         for x in &c.stripes {
-            for (a, b) in s.lookups.iter_mut().zip(&x.by) {
+            for (a, b) in s.lookups.iter_mut().flatten().zip(x.by.iter().flatten()) {
                 for (y, z) in a.iter_mut().zip(b) {
                     *y += z.load(Relaxed);
                 }

@@ -166,6 +166,31 @@ impl Found {
     pub const ALL: [Found; 4] = [Found::Small, Found::Main, Found::Other, Found::Miss];
 }
 
+/// Who a read is for: the `source` label of marco_store_lookups_total. A
+/// job's scan (a compaction reads every list of a shard past the cache)
+/// misses on pages nobody serves, so the hit ratio that says whether the
+/// budget holds the hot set counts requests and writes alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Source {
+    /// An RPC's reads.
+    Request,
+    /// A write's reads, a replay's included.
+    Write,
+    /// Checkpoints, compactions, list stats, verifies, the console and tools.
+    #[default]
+    Job,
+}
+
+impl Source {
+    pub const ALL: [Source; 3] = [Source::Request, Source::Write, Source::Job];
+
+    /// Its metric label.
+    pub fn name(self) -> &'static str {
+        ["request", "write", "job"][self as usize]
+    }
+}
+
 /// Lookups by structure and how they came out, `[structure][found]`.
 pub type LookupCounts = [[u32; 4]; 7];
 
@@ -586,6 +611,7 @@ pub struct Hold {
     /// Its clean passes add to the engine's bytes used: a request's, not a
     /// job's or a write's.
     pub(crate) count_used: bool,
+    pub(crate) source: Source,
 }
 
 /// Pins a request holds at most (8 MiB of pages): with 64 requests on the
@@ -612,6 +638,7 @@ impl Hold {
             fetched: 0,
             private: None,
             count_used: false,
+            source: Source::Job,
         }
     }
 
@@ -631,6 +658,7 @@ impl Hold {
         let mut h = Hold::new();
         h.page_limit = engine.page_limit();
         h.count_used = true;
+        h.source = Source::Request;
         h
     }
 
@@ -660,6 +688,7 @@ impl Hold {
         let mut h = Hold::none();
         h.quiet = true;
         h.count_used = false;
+        h.source = Source::Write;
         h
     }
 
@@ -670,6 +699,12 @@ impl Hold {
         h.keep = false;
         h.count_used = true;
         h
+    }
+
+    /// The same hold, its lookups counted under `source`.
+    pub fn source(mut self, source: Source) -> Hold {
+        self.source = source;
+        self
     }
 
     /// Whether it holds as many pins as it takes.
@@ -911,6 +946,22 @@ mod tests {
         assert!(none.pins().is_empty());
         hold.release();
         assert!(hold.pins().is_empty());
+    }
+
+    #[test]
+    fn lookups_count_under_the_holds_source() {
+        let (e, f) = engine();
+        let one = |cx: &ReadCx<'_>| cx.page_of(PageId::new(f, 0), Structure::InSmall).map(|_| ());
+        e.pass(&mut Hold::request(&e), one).unwrap();
+        e.pass(&mut Hold::none().source(Source::Request), one).unwrap();
+        e.pass(&mut Hold::write(), one).unwrap();
+        e.pass(&mut Hold::new().source(Source::Write), one).unwrap();
+        e.read_past(one).unwrap();
+        e.read(one).unwrap();
+        e.pass(&mut Hold::job(&e), one).unwrap();
+        let st = e.stats();
+        let n = |src: Source| st.lookups[src as usize][Structure::InSmall as usize][Found::Other as usize];
+        assert_eq!((n(Source::Request), n(Source::Write), n(Source::Job)), (2, 2, 3));
     }
 
     #[test]
